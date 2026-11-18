@@ -71,3 +71,13 @@ CREATE TABLE IF NOT EXISTS overworld_character_links (
 
 CREATE INDEX IF NOT EXISTS idx_overworld_character_links_character_id
   ON overworld_character_links (character_id);
+
+CREATE TABLE IF NOT EXISTS identity_assertion_replays (
+  replay_key VARCHAR(160) PRIMARY KEY,
+  account_id VARCHAR(128) NOT NULL,
+  expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+  consumed_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_identity_assertion_replays_expires_at
+  ON identity_assertion_replays (expires_at);

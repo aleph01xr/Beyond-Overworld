@@ -20,6 +20,7 @@ interface PublicClientAuthConfig {
   authoritativeProvider: 'local_dev' | 'dungeons';
   devLoginEnabled: boolean;
   localRegistrationEnabled: boolean;
+  registrationEnabled?: boolean;
   externalAssertionEnabled: boolean;
 }
 
@@ -46,6 +47,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
     authoritativeProvider: IS_PROD_BUILD ? 'dungeons' : 'local_dev',
     devLoginEnabled: !IS_PROD_BUILD,
     localRegistrationEnabled: !IS_PROD_BUILD,
+    registrationEnabled: true,
     externalAssertionEnabled: IS_PROD_BUILD,
   }));
   const [mode, setMode] = useState<AuthMode>('login');
@@ -65,6 +67,8 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
 
   const fxCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const latestChangelog = OVERWORLD_CHANGELOG[0];
+  const canRegister =
+    authConfig.registrationEnabled ?? authConfig.localRegistrationEnabled;
 
   useEffect(() => {
     let cancelled = false;
@@ -76,7 +80,8 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
       .then((cfg) => {
         if (!cancelled && cfg) {
           setAuthConfig(cfg);
-          if (!cfg.localRegistrationEnabled) {
+          const allowReg = cfg.registrationEnabled ?? cfg.localRegistrationEnabled;
+          if (!allowReg) {
             setMode('login');
           }
         }
@@ -144,7 +149,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
   }, []);
 
   const switchMode = (next: AuthMode) => {
-    if (next === 'register' && !authConfig.localRegistrationEnabled) {
+    if (next === 'register' && !canRegister) {
       return;
     }
     setMode(next);
@@ -165,7 +170,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
     e.preventDefault();
     setErrorMsg(null);
 
-    if (mode === 'register' && !authConfig.localRegistrationEnabled) {
+    if (mode === 'register' && !canRegister) {
       setMode('login');
       setErrorMsg('Accounts are managed in Beyond: Dungeons.');
       return;
@@ -402,8 +407,8 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
               </button>
             </label>
 
-            {/* Shared Class Selection in Register Mode (development only) */}
-            {mode === 'register' && authConfig.localRegistrationEnabled && (
+            {/* Shared Class Selection in Register Mode */}
+            {mode === 'register' && canRegister && (
               <div className="space-y-2 pt-1">
                 <div className="flex items-center justify-between text-xs">
                   <span className="font-display text-white text-xs sm:text-sm font-semibold">
@@ -492,9 +497,9 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
             </div>
           </form>
 
-          {/* Bottom Mode Switch & Dev Quick Fill (hidden when disabled in production) */}
+          {/* Bottom Mode Switch & Dev Quick Fill (Dev Login hidden in production) */}
           <div className="flex flex-wrap items-center justify-center gap-2.5 pt-3">
-            {authConfig.localRegistrationEnabled ? (
+            {canRegister ? (
               mode === 'login' ? (
                 <button
                   type="button"

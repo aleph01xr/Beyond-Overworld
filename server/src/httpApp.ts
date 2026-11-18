@@ -34,6 +34,26 @@ function resolveLoginErrorStatus(code: string | undefined): number {
   }
 }
 
+function resolveRegisterErrorStatus(code: string | undefined): number {
+  switch (code) {
+    case 'INVALID_REGISTRATION':
+    case 'INVALID_PAYLOAD':
+      return 400;
+    case 'LOCAL_REGISTRATION_DISABLED':
+      return 403;
+    case 'ACCOUNT_EXISTS':
+      return 409;
+    case 'EXTERNAL_PROVIDER_NOT_CONFIGURED':
+    case 'DUNGEONS_UNREACHABLE':
+    case 'DUNGEONS_TIMEOUT':
+    case 'DUNGEONS_AUTH_ERROR':
+    case 'INVALID_DUNGEONS_RESPONSE':
+      return 503;
+    default:
+      return 401;
+  }
+}
+
 export interface OverworldHttpAppDeps {
   authService: AuthService;
   instanceManager: WorldInstanceManager;
@@ -53,7 +73,7 @@ export function createOverworldHttpApp({
     res.json(authService.getPublicClientAuthConfig());
   });
 
-  // Local registration (strictly disabled in production when Dungeons is authoritative)
+  // Registration (delegates strictly to Beyond: Dungeons in production)
   app.post('/api/auth/register', async (req: Request, res: Response) => {
     const parsed = AuthRegisterSchema.safeParse(req.body);
     if (!parsed.success) {
@@ -70,8 +90,7 @@ export function createOverworldHttpApp({
       parsed.data.heroClass
     );
     if (!result.ok || !result.character || !result.token) {
-      const status =
-        result.code === 'LOCAL_REGISTRATION_DISABLED' ? 403 : 409;
+      const status = resolveRegisterErrorStatus(result.code);
       res.status(status).json({
         error: result.error ?? 'Registration failed.',
         code: result.code ?? 'REGISTRATION_FAILED',
@@ -220,11 +239,16 @@ export function createOverworldHttpApp({
   });
 
   app.get('/api/health', (_req: Request, res: Response) => {
-    res.json({
-      ok: true,
+    const db = getDatabaseStatus();
+    const identityProvider = authService.getIdentityProviderStatus();
+    const productionDbHealthy =
+      identityProvider.environment !== 'production' || db.mode === 'postgres';
+
+    res.status(productionDbHealthy ? 200 : 503).json({
+      ok: productionDbHealthy,
       service: 'beyond-overworld',
-      db: getDatabaseStatus(),
-      identityProvider: authService.getIdentityProviderStatus(),
+      db,
+      identityProvider,
       instances: instanceManager.listSummaries().length,
       onlinePlayers: instanceManager.getTotalConnectedPlayers(),
     });

@@ -49,18 +49,20 @@ Visual Development
 Added
 
 - Persistent PostgreSQL & fallback table `overworld_character_links` via migration `database/migrations/002_overworld_character_links.sql` mapping authoritative Beyond `account_id` to persistent Overworld `character_id`, Overworld Arena Honor, and equipped Armament slots without duplicating Dungeons permanent progression.
-- Backend HTTP endpoint `POST /api/auth/external-assertion` verifying HMAC-SHA256 signed Beyond: Dungeons identity assertions (`exp` expiration validation, clock-skew bounds, and single-use `jti`/digest replay protection) alongside public capability endpoint `GET /api/auth/config` and URL `?assertion=` handoff support in `App.tsx`.
-- Modular Express app factory `server/src/httpApp.ts` cleanly mapping unreachable/failing Dungeons responses to structured HTTP `503`/`401`/`403` errors.
+- Persistent assertion replay tracking table `identity_assertion_replays` via migration `database/migrations/003_identity_assertion_replays.sql` with atomic PostgreSQL consumption (`consumeAssertionReplay`), preserving replay protection across restarts and multiple Overworld instances.
+- Backend HTTP endpoint `POST /api/auth/external-assertion` verifying HMAC-SHA256 signed Beyond: Dungeons identity assertions (`exp` expiration validation, clock-skew bounds, and persistent single-use replay protection) alongside public capability endpoint `GET /api/auth/config` and URL `?assertion=` handoff support in `App.tsx`.
+- Modular Express app factory `server/src/httpApp.ts` cleanly mapping unreachable/failing Dungeons responses to structured HTTP `503`/`409`/`403`/`401`/`400` errors.
 
 Changed
 
-- Activated `DungeonsIdentityProvider` (`server/src/auth/identityProvider.ts`) to execute authenticated server-to-server `POST ${DUNGEONS_API_URL}/api/internal/identity/verify-credentials` and `GET ${DUNGEONS_API_URL}/api/internal/identity/account/:accountId` requests matching `Beyond-Dungeons` (`Authorization: Bearer` + `X-Beyond-Identity-Secret`), supporting signed `{ assertion }` and validated `{ identity }` payloads with timeout/unreachable resilience.
-- Updated `DevCharacterAdapter` (`server/src/characters/characterIntegrationAdapter.ts`) and `database.ts` (`initDatabase` executing sorted migrations `001`..`002`) so re-syncing authoritative Dungeons progression preserves existing `characterId`, Overworld `arenaHonor`, and compatible equipped Armament across reconnects and restarts.
-- Configured production mode (`NODE_ENV=production`) across `identityConfig.ts`, `authService.ts`, `httpApp.ts`, and `AuthScreen.tsx` to enforce Beyond: Dungeons as the sole identity provider and strictly disable Dev Login, local account registration, and local authentication fallbacks.
+- Activated `DungeonsIdentityProvider` (`server/src/auth/identityProvider.ts`) and `AuthService.register()` to execute authenticated server-to-server `POST ${DUNGEONS_API_URL}/api/internal/identity/verify-credentials`, `POST ${DUNGEONS_API_URL}/api/internal/identity/register`, and `GET ${DUNGEONS_API_URL}/api/internal/identity/account/:accountId` requests matching `Beyond-Dungeons` (`Authorization: Bearer` + `X-Beyond-Identity-Secret`), enabling both login and Dungeons-owned account creation through Overworld.
+- Updated `initDatabase()` (`server/src/persistence/database.ts`) and `server.ts` so production (`NODE_ENV=production`) fails fast on startup if `DATABASE_URL` is missing or PostgreSQL is unreachable instead of silently falling back to temporary in-memory storage.
+- Updated `DevCharacterAdapter` (`server/src/characters/characterIntegrationAdapter.ts`) so re-syncing authoritative Dungeons progression preserves existing `characterId`, Overworld `arenaHonor`, and compatible equipped Armament across reconnects and restarts.
+- Configured production mode (`NODE_ENV=production`) across `identityConfig.ts`, `authService.ts`, `httpApp.ts`, and `AuthScreen.tsx` to enforce Beyond: Dungeons as the sole identity provider for login and registration while strictly disabling Dev Login and local authentication fallbacks.
 
 Testing
 
-- Expanded `server/tests/identityIntegration.test.ts` verifying live HTTP mock Dungeons verification (`{ assertion }` & `{ identity }`), unreachable/5xx graceful failure handling, assertion expiry and replay protection, production route lockouts (`403`/`503`), exclusive Dungeons-driven `isAdmin` enforcement, and Honor/`characterId` preservation across simulated restarts.
+- Expanded `server/tests/identityIntegration.test.ts` verifying live HTTP mock Dungeons verification & registration (`/api/internal/identity/verify-credentials`, `/api/internal/identity/register`, `/api/internal/identity/account/:accountId`), unreachable/5xx failure handling, cross-instance persistent replay protection, production DB fail-fast startup, exclusive Dungeons-driven `isAdmin` enforcement, and Honor/`characterId` preservation across restarts.
 
 ---
 

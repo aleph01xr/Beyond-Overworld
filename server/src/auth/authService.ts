@@ -15,6 +15,7 @@ import {
 import {
   DungeonsIdentityProvider,
   LocalIdentityProvider,
+  type ReplayConsumerFn,
 } from './identityProvider.ts';
 
 export interface AuthSession {
@@ -42,6 +43,7 @@ export interface AuthServiceOptions {
   isProduction?: boolean;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
+  consumeReplay?: ReplayConsumerFn;
 }
 
 export interface IdentityProviderStatusSummary {
@@ -52,6 +54,7 @@ export interface IdentityProviderStatusSummary {
   externalProviderOperational: boolean;
   devLoginEnabled: boolean;
   localRegistrationEnabled: boolean;
+  registrationEnabled: boolean;
   externalConfig: PublicIdentityConfigStatus;
 }
 
@@ -60,6 +63,7 @@ export interface PublicClientAuthConfig {
   authoritativeProvider: IdentityProviderKind;
   devLoginEnabled: boolean;
   localRegistrationEnabled: boolean;
+  registrationEnabled: boolean;
   externalAssertionEnabled: boolean;
 }
 
@@ -86,6 +90,7 @@ export class AuthService {
     this.externalProvider = new DungeonsIdentityProvider(this.identityConfig, {
       fetchImpl: options?.fetchImpl,
       timeoutMs: options?.timeoutMs,
+      consumeReplay: options?.consumeReplay,
     });
 
     console.log(`[Auth] ${this.identityConfig.diagnosticMessage}`);
@@ -124,6 +129,7 @@ export class AuthService {
       externalProviderOperational: this.externalProvider.isOperational,
       devLoginEnabled: this.identityConfig.devLoginEnabled,
       localRegistrationEnabled: this.identityConfig.localRegistrationEnabled,
+      registrationEnabled: this.identityConfig.registrationEnabled,
       externalConfig: toPublicIdentityConfigStatus(this.identityConfig),
     };
   }
@@ -141,6 +147,7 @@ export class AuthService {
           : 'local_dev',
       devLoginEnabled: this.identityConfig.devLoginEnabled,
       localRegistrationEnabled: this.identityConfig.localRegistrationEnabled,
+      registrationEnabled: this.identityConfig.registrationEnabled,
       externalAssertionEnabled: this.externalProvider.isConfigured,
     };
   }
@@ -171,16 +178,54 @@ export class AuthService {
     password: string,
     heroClass: HeroClassId
   ): Promise<AuthResult> {
+    // In production, delegate account creation strictly to Beyond: Dungeons with zero local fallback.
     if (this.identityConfig.isProduction) {
-      const denied = await this.externalProvider.registerAccount();
-      return {
-        ok: false,
-        provider: 'dungeons',
-        code: 'LOCAL_REGISTRATION_DISABLED',
-        error:
-          denied.error ??
-          'Account registration is managed exclusively by Beyond: Dungeons in production.',
-      };
+      const externalResult = await this.externalProvider.registerAccount({
+        username: usernameRaw,
+        password,
+        preferredClass: heroClass,
+      });
+      if (!externalResult.ok || !externalResult.identity) {
+        return {
+          ok: false,
+          provider: 'dungeons',
+          code: externalResult.code ?? 'DUNGEONS_REGISTRATION_FAILED',
+          error:
+            externalResult.error ??
+            'Failed to create account in Beyond: Dungeons.',
+        };
+      }
+      return this.createAuthorizedSessionResult(
+        externalResult.identity,
+        'dungeons'
+      );
+    }
+
+    // In development, if Dungeons external provider is configured, register with Dungeons first
+    // and only fall back to local dev registration when Dungeons is unreachable/timed out.
+    if (this.externalProvider.isConfigured) {
+      const externalResult = await this.externalProvider.registerAccount({
+        username: usernameRaw,
+        password,
+        preferredClass: heroClass,
+      });
+      if (externalResult.ok && externalResult.identity) {
+        return this.createAuthorizedSessionResult(
+          externalResult.identity,
+          'dungeons'
+        );
+      }
+      if (
+        externalResult.code !== 'DUNGEONS_UNREACHABLE' &&
+        externalResult.code !== 'DUNGEONS_TIMEOUT'
+      ) {
+        return {
+          ok: false,
+          provider: 'dungeons',
+          code: externalResult.code ?? 'DUNGEONS_REGISTRATION_FAILED',
+          error: externalResult.error ?? 'Account registration failed.',
+        };
+      }
     }
 
     const verification = await this.localProvider.registerAccount({

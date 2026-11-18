@@ -59,22 +59,40 @@ const memorySurvivalResults: SurvivalResultInput[] = [];
 const memoryPublicEvents: PublicEventRecordInput[] = [];
 const memoryRewardClaims = new Map<string, RewardClaimInput>();
 const memoryCharacterLinks = new Map<string, OverworldCharacterLinkRecord>();
+const memoryAssertionReplays = new Map<string, number>();
+let lastReplayPruneAt = 0;
 
-export async function initDatabase(): Promise<DatabaseMode> {
+export interface InitDatabaseOptions {
+  allowMemoryFallback?: boolean;
+  databaseUrl?: string;
+}
+
+export async function initDatabase(
+  options?: InitDatabaseOptions
+): Promise<DatabaseMode> {
   if (initialized) return mode;
-  initialized = true;
 
-  const databaseUrl = process.env.DATABASE_URL?.trim();
+  const isProduction = process.env.NODE_ENV === 'production';
+  const allowMemoryFallback = options?.allowMemoryFallback ?? !isProduction;
+  const databaseUrl = (options?.databaseUrl ?? process.env.DATABASE_URL ?? '').trim();
+
   if (!databaseUrl) {
+    if (!allowMemoryFallback) {
+      throw new Error(
+        '[DB] FATAL: DATABASE_URL is required in production. Refusing to start with temporary in-memory storage.'
+      );
+    }
+    initialized = true;
     console.warn(
-      '[DB] DATABASE_URL is not configured. Using in-memory Overworld persistence fallback (no permanent progression stored here per DD-027).'
+      '[DB] DATABASE_URL is not configured. Using in-memory Overworld persistence fallback (development only).'
     );
     mode = 'memory';
     return mode;
   }
 
+  let candidatePool: Pool | null = null;
   try {
-    const candidatePool = new Pool({ connectionString: databaseUrl });
+    candidatePool = new Pool({ connectionString: databaseUrl });
     await candidatePool.query('SELECT 1');
 
     const migrationsDir = path.resolve(process.cwd(), 'database', 'migrations');
@@ -94,16 +112,26 @@ export async function initDatabase(): Promise<DatabaseMode> {
 
     pool = candidatePool;
     mode = 'postgres';
+    initialized = true;
     return mode;
   } catch (err) {
-    console.warn(
-      '[DB] Failed to initialize PostgreSQL; falling back to in-memory Overworld store:',
-      err instanceof Error ? err.message : String(err)
-    );
-    if (pool) {
-      await pool.end().catch(() => {});
-      pool = null;
+    if (candidatePool) {
+      await candidatePool.end().catch(() => {});
     }
+    pool = null;
+    const message = err instanceof Error ? err.message : String(err);
+
+    if (!allowMemoryFallback) {
+      throw new Error(
+        `[DB] FATAL: Failed to connect to PostgreSQL or run migrations in production (${message}). Refusing to start with temporary in-memory storage.`
+      );
+    }
+
+    initialized = true;
+    console.warn(
+      '[DB] Failed to initialize PostgreSQL; falling back to in-memory Overworld store (development only):',
+      message
+    );
     mode = 'memory';
     return mode;
   }
@@ -111,6 +139,54 @@ export async function initDatabase(): Promise<DatabaseMode> {
 
 export function getDatabaseStatus(): { mode: DatabaseMode; connected: boolean } {
   return { mode, connected: mode === 'postgres' && pool !== null };
+}
+
+/**
+ * Atomically consumes a signed assertion replay key until its expiration timestamp.
+ * Backed by PostgreSQL `identity_assertion_replays` in persistent/multi-instance deployments
+ * and an in-memory map during local development without Postgres.
+ * Returns `true` if newly consumed (valid), `false` if already redeemed before expiry (replay).
+ */
+export async function consumeAssertionReplay(
+  replayKey: string,
+  accountId: string,
+  expiresAtMs: number,
+  nowMs = Date.now()
+): Promise<boolean> {
+  if (pool) {
+    const res = await pool.query<{ replay_key: string }>(
+      `INSERT INTO identity_assertion_replays (replay_key, account_id, expires_at, consumed_at)
+       VALUES ($1, $2, to_timestamp($3 / 1000.0), NOW())
+       ON CONFLICT (replay_key) DO UPDATE SET
+         account_id = EXCLUDED.account_id,
+         expires_at = EXCLUDED.expires_at,
+         consumed_at = NOW()
+       WHERE identity_assertion_replays.expires_at <= NOW()
+       RETURNING replay_key`,
+      [replayKey, accountId, expiresAtMs]
+    );
+
+    if (nowMs - lastReplayPruneAt >= 5 * 60 * 1000) {
+      lastReplayPruneAt = nowMs;
+      void pool
+        .query('DELETE FROM identity_assertion_replays WHERE expires_at <= NOW()')
+        .catch(() => {});
+    }
+
+    return (res.rowCount ?? 0) > 0;
+  }
+
+  for (const [k, exp] of memoryAssertionReplays) {
+    if (exp <= nowMs) {
+      memoryAssertionReplays.delete(k);
+    }
+  }
+  const existingExp = memoryAssertionReplays.get(replayKey);
+  if (existingExp && existingExp > nowMs) {
+    return false;
+  }
+  memoryAssertionReplays.set(replayKey, expiresAtMs);
+  return true;
 }
 
 export async function getOverworldCharacterLink(
@@ -374,6 +450,8 @@ export function resetMemoryStoresForTest(): void {
   memoryPublicEvents.length = 0;
   memoryRewardClaims.clear();
   memoryCharacterLinks.clear();
+  memoryAssertionReplays.clear();
+  lastReplayPruneAt = 0;
 }
 
 export async function closeDatabase(): Promise<void> {

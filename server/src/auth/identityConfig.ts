@@ -12,6 +12,7 @@ export interface ResolvedIdentityConfig {
   localFallbackActive: boolean;
   devLoginEnabled: boolean;
   localRegistrationEnabled: boolean;
+  registrationEnabled: boolean;
   diagnosticMessage: string;
 }
 
@@ -23,6 +24,7 @@ export interface PublicIdentityConfigStatus {
   localFallbackActive: boolean;
   devLoginEnabled: boolean;
   localRegistrationEnabled: boolean;
+  registrationEnabled: boolean;
   diagnosticMessage: string;
 }
 
@@ -53,7 +55,8 @@ function normalizeHttpUrl(
 /**
  * Resolves backend-only configuration for Beyond: Dungeons shared identity integration.
  * In production (NODE_ENV=production), Dev Login and local authentication fallback are
- * strictly disabled so Beyond: Dungeons is the sole authoritative identity provider.
+ * strictly disabled so Beyond: Dungeons is the sole authoritative identity provider
+ * for both login and shared account registration.
  * Never expose BEYOND_IDENTITY_SECRET or internal URLs to frontend code.
  */
 export function resolveIdentityConfig(
@@ -78,6 +81,7 @@ export function resolveIdentityConfig(
       localFallbackActive,
       devLoginEnabled,
       localRegistrationEnabled,
+      registrationEnabled: localRegistrationEnabled,
       diagnosticMessage: isProduction
         ? 'Production mode requires DUNGEONS_API_URL and BEYOND_IDENTITY_SECRET; local fallback and Dev Login are disabled.'
         : 'External Beyond: Dungeons identity provider is not configured (DUNGEONS_API_URL and BEYOND_IDENTITY_SECRET unset). Using local development identity provider.',
@@ -109,6 +113,7 @@ export function resolveIdentityConfig(
       localFallbackActive,
       devLoginEnabled,
       localRegistrationEnabled,
+      registrationEnabled: localRegistrationEnabled,
       diagnosticMessage: isProduction
         ? `Production Beyond: Dungeons identity configuration invalid (${issues.join('; ')}). Local authentication fallback is disabled.`
         : `External Beyond: Dungeons identity configuration incomplete (${issues.join('; ')}). Local development identity provider remains active.`,
@@ -124,6 +129,7 @@ export function resolveIdentityConfig(
     localFallbackActive,
     devLoginEnabled,
     localRegistrationEnabled,
+    registrationEnabled: true,
     diagnosticMessage: isProduction
       ? 'Production authentication is configured to use Beyond: Dungeons as the authoritative identity provider (Dev Login and local fallback disabled).'
       : 'Beyond: Dungeons external identity adapter is configured alongside local development authentication.',
@@ -144,6 +150,7 @@ export function toPublicIdentityConfigStatus(
     localFallbackActive: config.localFallbackActive,
     devLoginEnabled: config.devLoginEnabled,
     localRegistrationEnabled: config.localRegistrationEnabled,
+    registrationEnabled: config.registrationEnabled,
     diagnosticMessage: config.diagnosticMessage,
   };
 }

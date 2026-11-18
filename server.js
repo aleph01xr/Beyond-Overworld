@@ -47,6 +47,7 @@ function resolveIdentityConfig(env = process.env, options) {
       localFallbackActive,
       devLoginEnabled,
       localRegistrationEnabled,
+      registrationEnabled: localRegistrationEnabled,
       diagnosticMessage: isProduction ? "Production mode requires DUNGEONS_API_URL and BEYOND_IDENTITY_SECRET; local fallback and Dev Login are disabled." : "External Beyond: Dungeons identity provider is not configured (DUNGEONS_API_URL and BEYOND_IDENTITY_SECRET unset). Using local development identity provider."
     };
   }
@@ -72,6 +73,7 @@ function resolveIdentityConfig(env = process.env, options) {
       localFallbackActive,
       devLoginEnabled,
       localRegistrationEnabled,
+      registrationEnabled: localRegistrationEnabled,
       diagnosticMessage: isProduction ? `Production Beyond: Dungeons identity configuration invalid (${issues.join("; ")}). Local authentication fallback is disabled.` : `External Beyond: Dungeons identity configuration incomplete (${issues.join("; ")}). Local development identity provider remains active.`
     };
   }
@@ -84,6 +86,7 @@ function resolveIdentityConfig(env = process.env, options) {
     localFallbackActive,
     devLoginEnabled,
     localRegistrationEnabled,
+    registrationEnabled: true,
     diagnosticMessage: isProduction ? "Production authentication is configured to use Beyond: Dungeons as the authoritative identity provider (Dev Login and local fallback disabled)." : "Beyond: Dungeons external identity adapter is configured alongside local development authentication."
   };
 }
@@ -96,6 +99,7 @@ function toPublicIdentityConfigStatus(config) {
     localFallbackActive: config.localFallbackActive,
     devLoginEnabled: config.devLoginEnabled,
     localRegistrationEnabled: config.localRegistrationEnabled,
+    registrationEnabled: config.registrationEnabled,
     diagnosticMessage: config.diagnosticMessage
   };
 }
@@ -220,6 +224,300 @@ var ClientMessageSchema = z.discriminatedUnion("type", [
     t: z.number().finite()
   })
 ]);
+
+// server/src/persistence/database.ts
+import fs from "node:fs";
+import path from "node:path";
+import { Pool } from "pg";
+var pool = null;
+var mode = "memory";
+var initialized = false;
+var memoryInstances = /* @__PURE__ */ new Map();
+var memoryHonorLedger = [];
+var memoryHonorKeys = /* @__PURE__ */ new Set();
+var memoryRewardClaims = /* @__PURE__ */ new Map();
+var memoryCharacterLinks = /* @__PURE__ */ new Map();
+var memoryAssertionReplays = /* @__PURE__ */ new Map();
+var lastReplayPruneAt = 0;
+async function initDatabase(options) {
+  if (initialized) return mode;
+  const isProduction = process.env.NODE_ENV === "production";
+  const allowMemoryFallback = options?.allowMemoryFallback ?? !isProduction;
+  const databaseUrl = (options?.databaseUrl ?? process.env.DATABASE_URL ?? "").trim();
+  if (!databaseUrl) {
+    if (!allowMemoryFallback) {
+      throw new Error(
+        "[DB] FATAL: DATABASE_URL is required in production. Refusing to start with temporary in-memory storage."
+      );
+    }
+    initialized = true;
+    console.warn(
+      "[DB] DATABASE_URL is not configured. Using in-memory Overworld persistence fallback (development only)."
+    );
+    mode = "memory";
+    return mode;
+  }
+  let candidatePool = null;
+  try {
+    candidatePool = new Pool({ connectionString: databaseUrl });
+    await candidatePool.query("SELECT 1");
+    const migrationsDir = path.resolve(process.cwd(), "database", "migrations");
+    if (fs.existsSync(migrationsDir)) {
+      const files = fs.readdirSync(migrationsDir).filter((f) => f.endsWith(".sql")).sort();
+      for (const file of files) {
+        const sql = fs.readFileSync(path.join(migrationsDir, file), "utf8");
+        await candidatePool.query(sql);
+      }
+      console.log(
+        `[DB] Connected to PostgreSQL and verified ${files.length} Overworld migration(s): ${files.join(", ")}.`
+      );
+    }
+    pool = candidatePool;
+    mode = "postgres";
+    initialized = true;
+    return mode;
+  } catch (err) {
+    if (candidatePool) {
+      await candidatePool.end().catch(() => {
+      });
+    }
+    pool = null;
+    const message = err instanceof Error ? err.message : String(err);
+    if (!allowMemoryFallback) {
+      throw new Error(
+        `[DB] FATAL: Failed to connect to PostgreSQL or run migrations in production (${message}). Refusing to start with temporary in-memory storage.`
+      );
+    }
+    initialized = true;
+    console.warn(
+      "[DB] Failed to initialize PostgreSQL; falling back to in-memory Overworld store (development only):",
+      message
+    );
+    mode = "memory";
+    return mode;
+  }
+}
+function getDatabaseStatus() {
+  return { mode, connected: mode === "postgres" && pool !== null };
+}
+async function consumeAssertionReplay(replayKey, accountId, expiresAtMs, nowMs = Date.now()) {
+  if (pool) {
+    const res = await pool.query(
+      `INSERT INTO identity_assertion_replays (replay_key, account_id, expires_at, consumed_at)
+       VALUES ($1, $2, to_timestamp($3 / 1000.0), NOW())
+       ON CONFLICT (replay_key) DO UPDATE SET
+         account_id = EXCLUDED.account_id,
+         expires_at = EXCLUDED.expires_at,
+         consumed_at = NOW()
+       WHERE identity_assertion_replays.expires_at <= NOW()
+       RETURNING replay_key`,
+      [replayKey, accountId, expiresAtMs]
+    );
+    if (nowMs - lastReplayPruneAt >= 5 * 60 * 1e3) {
+      lastReplayPruneAt = nowMs;
+      void pool.query("DELETE FROM identity_assertion_replays WHERE expires_at <= NOW()").catch(() => {
+      });
+    }
+    return (res.rowCount ?? 0) > 0;
+  }
+  for (const [k, exp] of memoryAssertionReplays) {
+    if (exp <= nowMs) {
+      memoryAssertionReplays.delete(k);
+    }
+  }
+  const existingExp = memoryAssertionReplays.get(replayKey);
+  if (existingExp && existingExp > nowMs) {
+    return false;
+  }
+  memoryAssertionReplays.set(replayKey, expiresAtMs);
+  return true;
+}
+async function getOverworldCharacterLink(accountId) {
+  if (pool) {
+    const res = await pool.query(
+      `SELECT account_id, character_id, identity_provider, arena_honor,
+              equipped_weapon_id, equipped_vestment_id, last_known_username
+       FROM overworld_character_links
+       WHERE account_id = $1`,
+      [accountId]
+    );
+    const row = res.rows[0];
+    if (!row) return null;
+    return {
+      accountId: row.account_id,
+      characterId: row.character_id,
+      identityProvider: row.identity_provider === "local_dev" ? "local_dev" : "dungeons",
+      arenaHonor: row.arena_honor,
+      equippedWeaponId: row.equipped_weapon_id,
+      equippedVestmentId: row.equipped_vestment_id,
+      lastKnownUsername: row.last_known_username
+    };
+  }
+  const existing = memoryCharacterLinks.get(accountId);
+  return existing ? { ...existing } : null;
+}
+async function upsertOverworldCharacterLink(record) {
+  if (pool) {
+    const res = await pool.query(
+      `INSERT INTO overworld_character_links (
+         account_id,
+         character_id,
+         identity_provider,
+         arena_honor,
+         equipped_weapon_id,
+         equipped_vestment_id,
+         last_known_username,
+         last_synced_at,
+         updated_at
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+       ON CONFLICT (account_id) DO UPDATE SET
+         identity_provider = EXCLUDED.identity_provider,
+         last_known_username = EXCLUDED.last_known_username,
+         arena_honor = GREATEST(overworld_character_links.arena_honor, EXCLUDED.arena_honor),
+         equipped_weapon_id = COALESCE(overworld_character_links.equipped_weapon_id, EXCLUDED.equipped_weapon_id),
+         equipped_vestment_id = COALESCE(overworld_character_links.equipped_vestment_id, EXCLUDED.equipped_vestment_id),
+         last_synced_at = NOW(),
+         updated_at = NOW()
+       RETURNING account_id, character_id, identity_provider, arena_honor,
+                 equipped_weapon_id, equipped_vestment_id, last_known_username`,
+      [
+        record.accountId,
+        record.characterId,
+        record.identityProvider,
+        Math.max(0, Math.trunc(record.arenaHonor)),
+        record.equippedWeaponId,
+        record.equippedVestmentId,
+        record.lastKnownUsername
+      ]
+    );
+    const row = res.rows[0];
+    return {
+      accountId: row.account_id,
+      characterId: row.character_id,
+      identityProvider: row.identity_provider === "local_dev" ? "local_dev" : "dungeons",
+      arenaHonor: row.arena_honor,
+      equippedWeaponId: row.equipped_weapon_id,
+      equippedVestmentId: row.equipped_vestment_id,
+      lastKnownUsername: row.last_known_username
+    };
+  }
+  const existing = memoryCharacterLinks.get(record.accountId);
+  if (existing) {
+    const merged = {
+      accountId: existing.accountId,
+      characterId: existing.characterId,
+      identityProvider: record.identityProvider,
+      arenaHonor: Math.max(existing.arenaHonor, Math.max(0, Math.trunc(record.arenaHonor))),
+      equippedWeaponId: existing.equippedWeaponId ?? record.equippedWeaponId,
+      equippedVestmentId: existing.equippedVestmentId ?? record.equippedVestmentId,
+      lastKnownUsername: record.lastKnownUsername ?? existing.lastKnownUsername
+    };
+    memoryCharacterLinks.set(record.accountId, merged);
+    return { ...merged };
+  }
+  const created = {
+    accountId: record.accountId,
+    characterId: record.characterId,
+    identityProvider: record.identityProvider,
+    arenaHonor: Math.max(0, Math.trunc(record.arenaHonor)),
+    equippedWeaponId: record.equippedWeaponId,
+    equippedVestmentId: record.equippedVestmentId,
+    lastKnownUsername: record.lastKnownUsername
+  };
+  memoryCharacterLinks.set(record.accountId, created);
+  return { ...created };
+}
+async function updateOverworldCharacterHonor(accountId, newHonorBalance) {
+  const safeBalance = Math.max(0, Math.trunc(newHonorBalance));
+  if (pool) {
+    await pool.query(
+      `UPDATE overworld_character_links
+       SET arena_honor = $2, updated_at = NOW()
+       WHERE account_id = $1`,
+      [accountId, safeBalance]
+    );
+    return;
+  }
+  const existing = memoryCharacterLinks.get(accountId);
+  if (existing) {
+    existing.arenaHonor = safeBalance;
+  }
+}
+async function updateOverworldCharacterArmament(accountId, slot, itemId) {
+  if (pool) {
+    const column = slot === "weapon" ? "equipped_weapon_id" : "equipped_vestment_id";
+    await pool.query(
+      `UPDATE overworld_character_links
+       SET ${column} = $2, updated_at = NOW()
+       WHERE account_id = $1`,
+      [accountId, itemId]
+    );
+    return;
+  }
+  const existing = memoryCharacterLinks.get(accountId);
+  if (existing) {
+    if (slot === "weapon") {
+      existing.equippedWeaponId = itemId;
+    } else {
+      existing.equippedVestmentId = itemId;
+    }
+  }
+}
+async function upsertInstanceRecord(summary) {
+  if (pool) {
+    await pool.query(
+      `INSERT INTO overworld_instances (instance_id, name, region_label, max_players, status, updated_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())
+       ON CONFLICT (instance_id) DO UPDATE SET
+         name = EXCLUDED.name,
+         region_label = EXCLUDED.region_label,
+         max_players = EXCLUDED.max_players,
+         status = EXCLUDED.status,
+         updated_at = NOW()`,
+      [summary.instanceId, summary.name, summary.regionLabel, summary.maxPlayers, summary.status]
+    );
+    return;
+  }
+  memoryInstances.set(summary.instanceId, { ...summary });
+}
+async function recordHonorEntry(entry) {
+  if (pool) {
+    const res = await pool.query(
+      `INSERT INTO arena_honor_ledger (character_id, delta_honor, balance_after, reason, idempotency_key)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (idempotency_key) DO NOTHING
+       RETURNING id`,
+      [entry.characterId, entry.deltaHonor, entry.balanceAfter, entry.reason, entry.idempotencyKey]
+    );
+    return (res.rowCount ?? 0) > 0;
+  }
+  if (memoryHonorKeys.has(entry.idempotencyKey)) return false;
+  memoryHonorKeys.add(entry.idempotencyKey);
+  memoryHonorLedger.push({ ...entry });
+  return true;
+}
+async function recordRewardClaim(claim) {
+  if (pool) {
+    const res = await pool.query(
+      `INSERT INTO overworld_reward_claims (claim_id, character_id, source_activity, reward_type, reward_payload)
+       VALUES ($1, $2, $3, $4, $5::jsonb)
+       ON CONFLICT (claim_id) DO NOTHING
+       RETURNING id`,
+      [
+        claim.claimId,
+        claim.characterId,
+        claim.sourceActivity,
+        claim.rewardType,
+        JSON.stringify(claim.rewardPayload)
+      ]
+    );
+    return (res.rowCount ?? 0) > 0;
+  }
+  if (memoryRewardClaims.has(claim.claimId)) return false;
+  memoryRewardClaims.set(claim.claimId, { ...claim });
+  return true;
+}
 
 // server/src/auth/identityProvider.ts
 function hashPassword(password) {
@@ -401,19 +699,19 @@ var SignedDungeonsAssertionPayloadSchema = SharedAccountIdentitySchema.extend({
   iat: z2.number().int().nonnegative().optional(),
   jti: z2.string().trim().min(4).max(128).optional()
 });
-var MAX_REPLAY_ENTRIES = 5e4;
 var MAX_CLOCK_SKEW_MS = 6e4;
 var DungeonsIdentityProvider = class {
   constructor(config, options) {
     this.config = config;
     this.fetchImpl = options?.fetchImpl ?? globalThis.fetch;
     this.timeoutMs = options?.timeoutMs ?? 5e3;
+    this.consumeReplay = options?.consumeReplay ?? ((replayKey, accountId, expiresAtMs) => consumeAssertionReplay(replayKey, accountId, expiresAtMs));
   }
   config;
   kind = "dungeons";
   fetchImpl;
   timeoutMs;
-  consumedAssertions = /* @__PURE__ */ new Map();
+  consumeReplay;
   get isConfigured() {
     return this.config.mode === "configured";
   }
@@ -432,10 +730,8 @@ var DungeonsIdentityProvider = class {
         error: "Beyond: Dungeons external identity provider is not configured (set DUNGEONS_API_URL and BEYOND_IDENTITY_SECRET)."
       };
     }
-    const endpoint = `${this.config.dungeonsApiUrl}/api/identity/verify`;
+    const endpoint = `${this.config.dungeonsApiUrl}/api/internal/identity/verify-credentials`;
     const body = JSON.stringify({ username: username.trim(), password });
-    const timestamp = String(Math.floor(Date.now() / 1e3));
-    const requestSig = createHmac("sha256", this.config.identitySecret).update(`${timestamp}.${body}`).digest("hex");
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
@@ -445,9 +741,8 @@ var DungeonsIdentityProvider = class {
           "Content-Type": "application/json",
           Accept: "application/json",
           Authorization: `Bearer ${this.config.identitySecret}`,
-          "X-Beyond-Service": "beyond-overworld",
-          "X-Beyond-Timestamp": timestamp,
-          "X-Beyond-Signature": requestSig
+          "X-Beyond-Identity-Secret": this.config.identitySecret,
+          "X-Beyond-Service": "beyond-overworld"
         },
         body,
         signal: controller.signal
@@ -458,7 +753,7 @@ var DungeonsIdentityProvider = class {
       } catch {
         payload = null;
       }
-      if (response.status === 401 || response.status === 403) {
+      if (response.status === 401) {
         return {
           ok: false,
           provider: this.kind,
@@ -504,8 +799,8 @@ var DungeonsIdentityProvider = class {
       clearTimeout(timer);
     }
   }
-  async registerAccount() {
-    if (!this.isConfigured) {
+  async fetchAccountSnapshot(accountId) {
+    if (!this.isConfigured || !this.config.dungeonsApiUrl || !this.config.identitySecret) {
       return {
         ok: false,
         provider: this.kind,
@@ -513,12 +808,139 @@ var DungeonsIdentityProvider = class {
         error: "Beyond: Dungeons external identity provider is not configured."
       };
     }
-    return {
-      ok: false,
-      provider: this.kind,
-      code: "EXTERNAL_ACCOUNT_OWNED_BY_DUNGEONS",
-      error: "Permanent Beyond accounts must be created in Beyond: Dungeons."
-    };
+    const endpoint = `${this.config.dungeonsApiUrl}/api/internal/identity/account/${encodeURIComponent(
+      accountId.trim()
+    )}`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    try {
+      const response = await this.fetchImpl(endpoint, {
+        method: "GET",
+        headers: {
+          Accept: "application/json",
+          Authorization: `Bearer ${this.config.identitySecret}`,
+          "X-Beyond-Identity-Secret": this.config.identitySecret,
+          "X-Beyond-Service": "beyond-overworld"
+        },
+        signal: controller.signal
+      });
+      let payload = null;
+      try {
+        payload = await response.json();
+      } catch {
+        payload = null;
+      }
+      if (!response.ok || !payload || typeof payload.assertion !== "string") {
+        return {
+          ok: false,
+          provider: this.kind,
+          code: response.status === 404 ? "ACCOUNT_NOT_FOUND" : "DUNGEONS_AUTH_ERROR",
+          error: typeof payload?.error === "string" ? payload.error : `Beyond: Dungeons account lookup failed (${response.status}).`
+        };
+      }
+      return this.verifySignedAssertion(payload.assertion);
+    } catch (err) {
+      const isTimeout = err instanceof Error && err.name === "AbortError";
+      return {
+        ok: false,
+        provider: this.kind,
+        code: isTimeout ? "DUNGEONS_TIMEOUT" : "DUNGEONS_UNREACHABLE",
+        error: isTimeout ? "Beyond: Dungeons identity service timed out." : "Beyond: Dungeons identity service is currently unreachable."
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  async registerAccount(params) {
+    if (!this.isConfigured || !this.config.dungeonsApiUrl || !this.config.identitySecret) {
+      return {
+        ok: false,
+        provider: this.kind,
+        code: "EXTERNAL_PROVIDER_NOT_CONFIGURED",
+        error: "Beyond: Dungeons external identity provider is not configured (set DUNGEONS_API_URL and BEYOND_IDENTITY_SECRET)."
+      };
+    }
+    const endpoint = `${this.config.dungeonsApiUrl}/api/internal/identity/register`;
+    const body = JSON.stringify({
+      username: params.username.trim(),
+      password: params.password,
+      preferredClass: params.preferredClass,
+      heroClass: params.preferredClass
+    });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    try {
+      const response = await this.fetchImpl(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+          Authorization: `Bearer ${this.config.identitySecret}`,
+          "X-Beyond-Identity-Secret": this.config.identitySecret,
+          "X-Beyond-Service": "beyond-overworld"
+        },
+        body,
+        signal: controller.signal
+      });
+      let payload = null;
+      try {
+        payload = await response.json();
+      } catch {
+        payload = null;
+      }
+      if (response.status === 409) {
+        return {
+          ok: false,
+          provider: this.kind,
+          code: "ACCOUNT_EXISTS",
+          error: typeof payload?.error === "string" ? payload.error : "That adventurer name is already claimed."
+        };
+      }
+      if (response.status === 400) {
+        return {
+          ok: false,
+          provider: this.kind,
+          code: "INVALID_REGISTRATION",
+          error: typeof payload?.error === "string" ? payload.error : "Invalid account registration payload."
+        };
+      }
+      if (!response.ok || !payload) {
+        return {
+          ok: false,
+          provider: this.kind,
+          code: "DUNGEONS_AUTH_ERROR",
+          error: typeof payload?.error === "string" ? payload.error : `Beyond: Dungeons account registration failed (${response.status}).`
+        };
+      }
+      if (typeof payload.assertion === "string") {
+        return this.verifySignedAssertion(payload.assertion);
+      }
+      const rawIdentity = payload.identity ?? payload.account ?? payload.user;
+      const parsedIdentity = SharedAccountIdentitySchema.safeParse(rawIdentity);
+      if (!parsedIdentity.success) {
+        return {
+          ok: false,
+          provider: this.kind,
+          code: "INVALID_DUNGEONS_RESPONSE",
+          error: "Beyond: Dungeons returned an invalid registration response."
+        };
+      }
+      return {
+        ok: true,
+        provider: this.kind,
+        identity: parsedIdentity.data
+      };
+    } catch (err) {
+      const isTimeout = err instanceof Error && err.name === "AbortError";
+      return {
+        ok: false,
+        provider: this.kind,
+        code: isTimeout ? "DUNGEONS_TIMEOUT" : "DUNGEONS_UNREACHABLE",
+        error: isTimeout ? "Beyond: Dungeons registration service timed out." : "Beyond: Dungeons identity service is currently unreachable."
+      };
+    } finally {
+      clearTimeout(timer);
+    }
   }
   async verifySignedAssertion(assertionToken) {
     const secret = this.config.identitySecret;
@@ -593,10 +1015,9 @@ var DungeonsIdentityProvider = class {
         };
       }
     }
-    this.pruneExpiredReplays(nowMs);
     const replayKey = parsed.data.jti ? `jti:${parsed.data.jti}` : `tok:${createHash("sha256").update(normalizedToken).digest("hex")}`;
-    const priorExpiry = this.consumedAssertions.get(replayKey);
-    if (priorExpiry && priorExpiry > nowMs) {
+    const consumed = await this.consumeReplay(replayKey, parsed.data.accountId, expMs);
+    if (!consumed) {
       return {
         ok: false,
         provider: this.kind,
@@ -604,7 +1025,6 @@ var DungeonsIdentityProvider = class {
         error: "Beyond identity assertion has already been redeemed."
       };
     }
-    this.consumedAssertions.set(replayKey, expMs);
     return {
       ok: true,
       provider: this.kind,
@@ -625,17 +1045,6 @@ var DungeonsIdentityProvider = class {
       }
     };
   }
-  pruneExpiredReplays(nowMs) {
-    for (const [key, expMs] of this.consumedAssertions) {
-      if (expMs <= nowMs) {
-        this.consumedAssertions.delete(key);
-      }
-    }
-    if (this.consumedAssertions.size >= MAX_REPLAY_ENTRIES) {
-      const oldestKey = this.consumedAssertions.keys().next().value;
-      if (oldestKey) this.consumedAssertions.delete(oldestKey);
-    }
-  }
 };
 
 // server/src/auth/authService.ts
@@ -652,7 +1061,8 @@ var AuthService = class {
     });
     this.externalProvider = new DungeonsIdentityProvider(this.identityConfig, {
       fetchImpl: options?.fetchImpl,
-      timeoutMs: options?.timeoutMs
+      timeoutMs: options?.timeoutMs,
+      consumeReplay: options?.consumeReplay
     });
     console.log(`[Auth] ${this.identityConfig.diagnosticMessage}`);
     if (!this.identityConfig.isProduction && (options?.seedDevAccount ?? true)) {
@@ -688,6 +1098,7 @@ var AuthService = class {
       externalProviderOperational: this.externalProvider.isOperational,
       devLoginEnabled: this.identityConfig.devLoginEnabled,
       localRegistrationEnabled: this.identityConfig.localRegistrationEnabled,
+      registrationEnabled: this.identityConfig.registrationEnabled,
       externalConfig: toPublicIdentityConfigStatus(this.identityConfig)
     };
   }
@@ -700,6 +1111,7 @@ var AuthService = class {
       authoritativeProvider: this.identityConfig.isProduction ? "dungeons" : this.externalProvider.isConfigured ? "dungeons" : "local_dev",
       devLoginEnabled: this.identityConfig.devLoginEnabled,
       localRegistrationEnabled: this.identityConfig.localRegistrationEnabled,
+      registrationEnabled: this.identityConfig.registrationEnabled,
       externalAssertionEnabled: this.externalProvider.isConfigured
     };
   }
@@ -718,13 +1130,44 @@ var AuthService = class {
   }
   async register(usernameRaw, password, heroClass) {
     if (this.identityConfig.isProduction) {
-      const denied = await this.externalProvider.registerAccount();
-      return {
-        ok: false,
-        provider: "dungeons",
-        code: "LOCAL_REGISTRATION_DISABLED",
-        error: denied.error ?? "Account registration is managed exclusively by Beyond: Dungeons in production."
-      };
+      const externalResult = await this.externalProvider.registerAccount({
+        username: usernameRaw,
+        password,
+        preferredClass: heroClass
+      });
+      if (!externalResult.ok || !externalResult.identity) {
+        return {
+          ok: false,
+          provider: "dungeons",
+          code: externalResult.code ?? "DUNGEONS_REGISTRATION_FAILED",
+          error: externalResult.error ?? "Failed to create account in Beyond: Dungeons."
+        };
+      }
+      return this.createAuthorizedSessionResult(
+        externalResult.identity,
+        "dungeons"
+      );
+    }
+    if (this.externalProvider.isConfigured) {
+      const externalResult = await this.externalProvider.registerAccount({
+        username: usernameRaw,
+        password,
+        preferredClass: heroClass
+      });
+      if (externalResult.ok && externalResult.identity) {
+        return this.createAuthorizedSessionResult(
+          externalResult.identity,
+          "dungeons"
+        );
+      }
+      if (externalResult.code !== "DUNGEONS_UNREACHABLE" && externalResult.code !== "DUNGEONS_TIMEOUT") {
+        return {
+          ok: false,
+          provider: "dungeons",
+          code: externalResult.code ?? "DUNGEONS_REGISTRATION_FAILED",
+          error: externalResult.error ?? "Account registration failed."
+        };
+      }
     }
     const verification = await this.localProvider.registerAccount({
       username: usernameRaw,
@@ -1103,250 +1546,6 @@ function getDefaultVestmentId(heroClass) {
   return `vest_${heroClass}_default`;
 }
 
-// server/src/persistence/database.ts
-import fs from "node:fs";
-import path from "node:path";
-import { Pool } from "pg";
-var pool = null;
-var mode = "memory";
-var initialized = false;
-var memoryInstances = /* @__PURE__ */ new Map();
-var memoryHonorLedger = [];
-var memoryHonorKeys = /* @__PURE__ */ new Set();
-var memoryRewardClaims = /* @__PURE__ */ new Map();
-var memoryCharacterLinks = /* @__PURE__ */ new Map();
-async function initDatabase() {
-  if (initialized) return mode;
-  initialized = true;
-  const databaseUrl = process.env.DATABASE_URL?.trim();
-  if (!databaseUrl) {
-    console.warn(
-      "[DB] DATABASE_URL is not configured. Using in-memory Overworld persistence fallback (no permanent progression stored here per DD-027)."
-    );
-    mode = "memory";
-    return mode;
-  }
-  try {
-    const candidatePool = new Pool({ connectionString: databaseUrl });
-    await candidatePool.query("SELECT 1");
-    const migrationsDir = path.resolve(process.cwd(), "database", "migrations");
-    if (fs.existsSync(migrationsDir)) {
-      const files = fs.readdirSync(migrationsDir).filter((f) => f.endsWith(".sql")).sort();
-      for (const file of files) {
-        const sql = fs.readFileSync(path.join(migrationsDir, file), "utf8");
-        await candidatePool.query(sql);
-      }
-      console.log(
-        `[DB] Connected to PostgreSQL and verified ${files.length} Overworld migration(s): ${files.join(", ")}.`
-      );
-    }
-    pool = candidatePool;
-    mode = "postgres";
-    return mode;
-  } catch (err) {
-    console.warn(
-      "[DB] Failed to initialize PostgreSQL; falling back to in-memory Overworld store:",
-      err instanceof Error ? err.message : String(err)
-    );
-    if (pool) {
-      await pool.end().catch(() => {
-      });
-      pool = null;
-    }
-    mode = "memory";
-    return mode;
-  }
-}
-function getDatabaseStatus() {
-  return { mode, connected: mode === "postgres" && pool !== null };
-}
-async function getOverworldCharacterLink(accountId) {
-  if (pool) {
-    const res = await pool.query(
-      `SELECT account_id, character_id, identity_provider, arena_honor,
-              equipped_weapon_id, equipped_vestment_id, last_known_username
-       FROM overworld_character_links
-       WHERE account_id = $1`,
-      [accountId]
-    );
-    const row = res.rows[0];
-    if (!row) return null;
-    return {
-      accountId: row.account_id,
-      characterId: row.character_id,
-      identityProvider: row.identity_provider === "local_dev" ? "local_dev" : "dungeons",
-      arenaHonor: row.arena_honor,
-      equippedWeaponId: row.equipped_weapon_id,
-      equippedVestmentId: row.equipped_vestment_id,
-      lastKnownUsername: row.last_known_username
-    };
-  }
-  const existing = memoryCharacterLinks.get(accountId);
-  return existing ? { ...existing } : null;
-}
-async function upsertOverworldCharacterLink(record) {
-  if (pool) {
-    const res = await pool.query(
-      `INSERT INTO overworld_character_links (
-         account_id,
-         character_id,
-         identity_provider,
-         arena_honor,
-         equipped_weapon_id,
-         equipped_vestment_id,
-         last_known_username,
-         last_synced_at,
-         updated_at
-       )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
-       ON CONFLICT (account_id) DO UPDATE SET
-         identity_provider = EXCLUDED.identity_provider,
-         last_known_username = EXCLUDED.last_known_username,
-         arena_honor = GREATEST(overworld_character_links.arena_honor, EXCLUDED.arena_honor),
-         equipped_weapon_id = COALESCE(overworld_character_links.equipped_weapon_id, EXCLUDED.equipped_weapon_id),
-         equipped_vestment_id = COALESCE(overworld_character_links.equipped_vestment_id, EXCLUDED.equipped_vestment_id),
-         last_synced_at = NOW(),
-         updated_at = NOW()
-       RETURNING account_id, character_id, identity_provider, arena_honor,
-                 equipped_weapon_id, equipped_vestment_id, last_known_username`,
-      [
-        record.accountId,
-        record.characterId,
-        record.identityProvider,
-        Math.max(0, Math.trunc(record.arenaHonor)),
-        record.equippedWeaponId,
-        record.equippedVestmentId,
-        record.lastKnownUsername
-      ]
-    );
-    const row = res.rows[0];
-    return {
-      accountId: row.account_id,
-      characterId: row.character_id,
-      identityProvider: row.identity_provider === "local_dev" ? "local_dev" : "dungeons",
-      arenaHonor: row.arena_honor,
-      equippedWeaponId: row.equipped_weapon_id,
-      equippedVestmentId: row.equipped_vestment_id,
-      lastKnownUsername: row.last_known_username
-    };
-  }
-  const existing = memoryCharacterLinks.get(record.accountId);
-  if (existing) {
-    const merged = {
-      accountId: existing.accountId,
-      characterId: existing.characterId,
-      identityProvider: record.identityProvider,
-      arenaHonor: Math.max(existing.arenaHonor, Math.max(0, Math.trunc(record.arenaHonor))),
-      equippedWeaponId: existing.equippedWeaponId ?? record.equippedWeaponId,
-      equippedVestmentId: existing.equippedVestmentId ?? record.equippedVestmentId,
-      lastKnownUsername: record.lastKnownUsername ?? existing.lastKnownUsername
-    };
-    memoryCharacterLinks.set(record.accountId, merged);
-    return { ...merged };
-  }
-  const created = {
-    accountId: record.accountId,
-    characterId: record.characterId,
-    identityProvider: record.identityProvider,
-    arenaHonor: Math.max(0, Math.trunc(record.arenaHonor)),
-    equippedWeaponId: record.equippedWeaponId,
-    equippedVestmentId: record.equippedVestmentId,
-    lastKnownUsername: record.lastKnownUsername
-  };
-  memoryCharacterLinks.set(record.accountId, created);
-  return { ...created };
-}
-async function updateOverworldCharacterHonor(accountId, newHonorBalance) {
-  const safeBalance = Math.max(0, Math.trunc(newHonorBalance));
-  if (pool) {
-    await pool.query(
-      `UPDATE overworld_character_links
-       SET arena_honor = $2, updated_at = NOW()
-       WHERE account_id = $1`,
-      [accountId, safeBalance]
-    );
-    return;
-  }
-  const existing = memoryCharacterLinks.get(accountId);
-  if (existing) {
-    existing.arenaHonor = safeBalance;
-  }
-}
-async function updateOverworldCharacterArmament(accountId, slot, itemId) {
-  if (pool) {
-    const column = slot === "weapon" ? "equipped_weapon_id" : "equipped_vestment_id";
-    await pool.query(
-      `UPDATE overworld_character_links
-       SET ${column} = $2, updated_at = NOW()
-       WHERE account_id = $1`,
-      [accountId, itemId]
-    );
-    return;
-  }
-  const existing = memoryCharacterLinks.get(accountId);
-  if (existing) {
-    if (slot === "weapon") {
-      existing.equippedWeaponId = itemId;
-    } else {
-      existing.equippedVestmentId = itemId;
-    }
-  }
-}
-async function upsertInstanceRecord(summary) {
-  if (pool) {
-    await pool.query(
-      `INSERT INTO overworld_instances (instance_id, name, region_label, max_players, status, updated_at)
-       VALUES ($1, $2, $3, $4, $5, NOW())
-       ON CONFLICT (instance_id) DO UPDATE SET
-         name = EXCLUDED.name,
-         region_label = EXCLUDED.region_label,
-         max_players = EXCLUDED.max_players,
-         status = EXCLUDED.status,
-         updated_at = NOW()`,
-      [summary.instanceId, summary.name, summary.regionLabel, summary.maxPlayers, summary.status]
-    );
-    return;
-  }
-  memoryInstances.set(summary.instanceId, { ...summary });
-}
-async function recordHonorEntry(entry) {
-  if (pool) {
-    const res = await pool.query(
-      `INSERT INTO arena_honor_ledger (character_id, delta_honor, balance_after, reason, idempotency_key)
-       VALUES ($1, $2, $3, $4, $5)
-       ON CONFLICT (idempotency_key) DO NOTHING
-       RETURNING id`,
-      [entry.characterId, entry.deltaHonor, entry.balanceAfter, entry.reason, entry.idempotencyKey]
-    );
-    return (res.rowCount ?? 0) > 0;
-  }
-  if (memoryHonorKeys.has(entry.idempotencyKey)) return false;
-  memoryHonorKeys.add(entry.idempotencyKey);
-  memoryHonorLedger.push({ ...entry });
-  return true;
-}
-async function recordRewardClaim(claim) {
-  if (pool) {
-    const res = await pool.query(
-      `INSERT INTO overworld_reward_claims (claim_id, character_id, source_activity, reward_type, reward_payload)
-       VALUES ($1, $2, $3, $4, $5::jsonb)
-       ON CONFLICT (claim_id) DO NOTHING
-       RETURNING id`,
-      [
-        claim.claimId,
-        claim.characterId,
-        claim.sourceActivity,
-        claim.rewardType,
-        JSON.stringify(claim.rewardPayload)
-      ]
-    );
-    return (res.rowCount ?? 0) > 0;
-  }
-  if (memoryRewardClaims.has(claim.claimId)) return false;
-  memoryRewardClaims.set(claim.claimId, { ...claim });
-  return true;
-}
-
 // server/src/characters/characterIntegrationAdapter.ts
 function isCompatibleArmamentItem(itemId, slot, heroClass) {
   if (!itemId) return false;
@@ -1606,6 +1805,25 @@ function resolveLoginErrorStatus(code) {
       return 401;
   }
 }
+function resolveRegisterErrorStatus(code) {
+  switch (code) {
+    case "INVALID_REGISTRATION":
+    case "INVALID_PAYLOAD":
+      return 400;
+    case "LOCAL_REGISTRATION_DISABLED":
+      return 403;
+    case "ACCOUNT_EXISTS":
+      return 409;
+    case "EXTERNAL_PROVIDER_NOT_CONFIGURED":
+    case "DUNGEONS_UNREACHABLE":
+    case "DUNGEONS_TIMEOUT":
+    case "DUNGEONS_AUTH_ERROR":
+    case "INVALID_DUNGEONS_RESPONSE":
+      return 503;
+    default:
+      return 401;
+  }
+}
 function createOverworldHttpApp({
   authService,
   instanceManager,
@@ -1631,7 +1849,7 @@ function createOverworldHttpApp({
       parsed.data.heroClass
     );
     if (!result.ok || !result.character || !result.token) {
-      const status = result.code === "LOCAL_REGISTRATION_DISABLED" ? 403 : 409;
+      const status = resolveRegisterErrorStatus(result.code);
       res.status(status).json({
         error: result.error ?? "Registration failed.",
         code: result.code ?? "REGISTRATION_FAILED"
@@ -1759,11 +1977,14 @@ function createOverworldHttpApp({
     res.status(403).json({ error: rejected.reason });
   });
   app.get("/api/health", (_req, res) => {
-    res.json({
-      ok: true,
+    const db = getDatabaseStatus();
+    const identityProvider = authService.getIdentityProviderStatus();
+    const productionDbHealthy = identityProvider.environment !== "production" || db.mode === "postgres";
+    res.status(productionDbHealthy ? 200 : 503).json({
+      ok: productionDbHealthy,
       service: "beyond-overworld",
-      db: getDatabaseStatus(),
-      identityProvider: authService.getIdentityProviderStatus(),
+      db,
+      identityProvider,
       instances: instanceManager.listSummaries().length,
       onlinePlayers: instanceManager.getTotalConnectedPlayers()
     });
@@ -3257,4 +3478,10 @@ async function startServer() {
     console.log(`[Server] Beyond: Overworld listening on http://0.0.0.0:${port}`);
   });
 }
-void startServer();
+startServer().catch((err) => {
+  console.error(
+    "[Server] Fatal startup failure:",
+    err instanceof Error ? err.message : String(err)
+  );
+  process.exit(1);
+});

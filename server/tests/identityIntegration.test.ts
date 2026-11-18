@@ -15,7 +15,11 @@ import { signDungeonsIdentityAssertion } from '../src/auth/identityProvider.ts';
 import { DevCharacterAdapter } from '../src/characters/characterIntegrationAdapter.ts';
 import { createOverworldHttpApp } from '../src/httpApp.ts';
 import { WorldInstanceManager } from '../src/instances/worldInstanceManager.ts';
-import { resetMemoryStoresForTest } from '../src/persistence/database.ts';
+import {
+  closeDatabase,
+  initDatabase,
+  resetMemoryStoresForTest,
+} from '../src/persistence/database.ts';
 import { ProgressionIntegrationLayer } from '../src/progression/progressionIntegration.ts';
 import { getDefaultWeaponId } from '../../shared/constants/classes.ts';
 import { AuthRegisterSchema } from '../../shared/validation/schemas.ts';
@@ -329,6 +333,64 @@ describe('Shared Account Identity Integration', () => {
         return;
       }
 
+      if (
+        req.method === 'POST' &&
+        req.url === '/api/internal/identity/register'
+      ) {
+        if (
+          req.headers.authorization !== `Bearer ${secret}` ||
+          req.headers['x-beyond-identity-secret'] !== secret
+        ) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Forbidden' }));
+          return;
+        }
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) chunks.push(chunk as Buffer);
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
+          username: string;
+          password: string;
+          preferredClass?: string;
+        };
+        if (body.username.toLowerCase() === 'champion') {
+          res.writeHead(409, { 'Content-Type': 'application/json' });
+          res.end(
+            JSON.stringify({ error: 'That adventurer name is already claimed.' })
+          );
+          return;
+        }
+        const chosenClass =
+          body.preferredClass === 'ranger' ||
+          body.preferredClass === 'arcanist' ||
+          body.preferredClass === 'cleric'
+            ? body.preferredClass
+            : 'vanguard';
+        const assertion = signDungeonsIdentityAssertion(
+          {
+            iss: 'beyond-dungeons',
+            aud: 'beyond-overworld',
+            exp: Math.floor(Date.now() / 1000) + 60,
+            accountId: `usr_dungeons_reg_${body.username.toLowerCase()}`,
+            username: body.username,
+            isAdmin: false,
+            preferredClass: chosenClass,
+            lockedClass: chosenClass,
+            level: 1,
+            xp: 0,
+            strength: 0,
+            vitality: 0,
+            dexterity: 0,
+            intelligence: 0,
+            faith: 0,
+            attributePoints: 0,
+          },
+          secret
+        );
+        res.writeHead(201, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ assertion }));
+        return;
+      }
+
       res.writeHead(404);
       res.end();
     });
@@ -399,10 +461,17 @@ describe('Shared Account Identity Integration', () => {
     expect(backend502.ok).toBe(false);
     expect(backend502.code).toBe('DUNGEONS_AUTH_ERROR');
 
-    // 4. Register calls against Dungeons provider refuse duplicate account creation
-    const remoteRegCheck = await auth.getExternalProvider().registerAccount();
-    expect(remoteRegCheck.ok).toBe(false);
-    expect(remoteRegCheck.code).toBe('EXTERNAL_ACCOUNT_OWNED_BY_DUNGEONS');
+    // 4. Register calls against Dungeons provider delegate to Beyond: Dungeons /api/internal/identity/register
+    const remoteRegOk = await auth.register('NewValkyrie', 'valkyriePass99', 'cleric');
+    expect(remoteRegOk.ok).toBe(true);
+    expect(remoteRegOk.provider).toBe('dungeons');
+    expect(remoteRegOk.character?.accountId).toBe('usr_dungeons_reg_newvalkyrie');
+    expect(remoteRegOk.character?.lockedClass).toBe('cleric');
+    expect(remoteRegOk.isAdmin).toBe(false);
+
+    const remoteRegConflict = await auth.register('Champion', 'pass123456', 'vanguard');
+    expect(remoteRegConflict.ok).toBe(false);
+    expect(remoteRegConflict.code).toBe('ACCOUNT_EXISTS');
 
     // 5. Reject unsigned, tampered, and expired assertions
     const expiredAssertion = signDungeonsIdentityAssertion(
@@ -497,7 +566,7 @@ describe('Shared Account Identity Integration', () => {
     const overworldHttp = await startHttpServer(app);
     activeClosers.push(overworldHttp.close);
 
-    // 1. Public config endpoint tells frontend to hide Dev Login and local registration, leaking zero secrets/URLs
+    // 1. Public config endpoint hides Dev Login and local registration, enables Dungeons-backed registration, and leaks zero secrets/URLs
     const cfgRes = await fetch(`${overworldHttp.url}/api/auth/config`);
     expect(cfgRes.status).toBe(200);
     const cfgBody = await cfgRes.json();
@@ -506,12 +575,13 @@ describe('Shared Account Identity Integration', () => {
       authoritativeProvider: 'dungeons',
       devLoginEnabled: false,
       localRegistrationEnabled: false,
+      registrationEnabled: true,
       externalAssertionEnabled: true,
     });
     expect(JSON.stringify(cfgBody)).not.toContain(secret);
     expect(JSON.stringify(cfgBody)).not.toContain(deadUrl);
 
-    // 2. Local registration endpoint is blocked with 403 in production
+    // 2. Production registration delegates to Dungeons (returns 503 DUNGEONS_UNREACHABLE when Dungeons is down, ZERO local fallback)
     const regRes = await fetch(`${overworldHttp.url}/api/auth/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -521,9 +591,9 @@ describe('Shared Account Identity Integration', () => {
         heroClass: 'arcanist',
       }),
     });
-    expect(regRes.status).toBe(403);
+    expect(regRes.status).toBe(503);
     const regData = (await regRes.json()) as { code: string };
-    expect(regData.code).toBe('LOCAL_REGISTRATION_DISABLED');
+    expect(regData.code).toBe('DUNGEONS_UNREACHABLE');
 
     // 3. Dev Login credentials (wanderer) fail with 503 DUNGEONS_UNREACHABLE (zero local dev seed / zero fallback)
     const devLoginRes = await fetch(`${overworldHttp.url}/api/auth/login`, {
@@ -765,5 +835,71 @@ describe('Shared Account Identity Integration', () => {
     expect(secondLogin.character?.xp).toBe(9800);
     expect(secondLogin.character?.attributes.faith).toBe(28);
     expect(secondLogin.character?.arenaHonor).toBe(125);
+  });
+
+  it('persists replay protection across Overworld instances/restarts and rejects silent in-memory DB fallback in production', async () => {
+    const secret = 'multi_node_replay_secret_min_32_chars!';
+    const env = {
+      NODE_ENV: 'production',
+      DUNGEONS_API_URL: 'https://dungeons.internal.test',
+      BEYOND_IDENTITY_SECRET: secret,
+    };
+
+    // Two distinct AuthService/DungeonsIdentityProvider instances (simulating restart or horizontal scaling)
+    const node1Auth = new AuthService(new DevCharacterAdapter(), {
+      env,
+      isProduction: true,
+    });
+    const node2Auth = new AuthService(new DevCharacterAdapter(), {
+      env,
+      isProduction: true,
+    });
+
+    const sharedAssertion = signDungeonsIdentityAssertion(
+      {
+        iss: 'beyond-dungeons',
+        aud: 'beyond-overworld',
+        exp: Math.floor(Date.now() / 1000) + 300,
+        jti: 'cross_instance_replay_nonce_777',
+        accountId: 'usr_cross_node',
+        username: 'CrossNodeHero',
+        isAdmin: false,
+        preferredClass: 'vanguard',
+        lockedClass: 'vanguard',
+        level: 8,
+        xp: 900,
+        strength: 12,
+        vitality: 10,
+        dexterity: 4,
+        intelligence: 2,
+        faith: 2,
+        attributePoints: 0,
+      },
+      secret
+    );
+
+    const firstAttempt = await node1Auth.authenticateExternalAssertion(sharedAssertion);
+    expect(firstAttempt.ok).toBe(true);
+
+    // Node 2 (or restarted process) MUST reject the already-consumed assertion
+    const secondAttemptOnNode2 =
+      await node2Auth.authenticateExternalAssertion(sharedAssertion);
+    expect(secondAttemptOnNode2.ok).toBe(false);
+    expect(secondAttemptOnNode2.code).toBe('ASSERTION_REPLAYED');
+
+    // Production DB fail-fast guard: must throw instead of silently falling back to memory
+    await closeDatabase();
+    await expect(
+      initDatabase({ allowMemoryFallback: false, databaseUrl: '' })
+    ).rejects.toThrow(/DATABASE_URL is required in production/i);
+
+    await closeDatabase();
+    await expect(
+      initDatabase({
+        allowMemoryFallback: false,
+        databaseUrl: 'postgres://invalid:invalid@127.0.0.1:1/nonexistent',
+      })
+    ).rejects.toThrow(/Refusing to start with temporary in-memory storage/i);
+    await closeDatabase();
   });
 });

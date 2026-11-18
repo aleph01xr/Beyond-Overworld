@@ -14,6 +14,7 @@ import type {
 } from '../../../shared/types/domain.ts';
 import { HeroClassSchema } from '../../../shared/validation/schemas.ts';
 import type { ResolvedIdentityConfig } from './identityConfig.ts';
+import { consumeAssertionReplay } from '../persistence/database.ts';
 
 export interface IdentityVerificationResult {
   ok: boolean;
@@ -307,29 +308,35 @@ export function signDungeonsIdentityAssertion(
   return `${encodedPayload}.${signature}`;
 }
 
+export type ReplayConsumerFn = (
+  replayKey: string,
+  accountId: string,
+  expiresAtMs: number
+) => Promise<boolean>;
+
 export interface DungeonsIdentityProviderOptions {
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
+  consumeReplay?: ReplayConsumerFn;
 }
 
-const MAX_REPLAY_ENTRIES = 50_000;
 const MAX_CLOCK_SKEW_MS = 60_000;
 
 /**
  * Authoritative External Identity Provider Adapter for Beyond: Dungeons.
  *
  * Enforces:
- * - Overworld does NOT independently verify Dungeons passwords.
- * - Overworld does NOT create duplicate permanent Dungeons accounts.
- * - Server-to-server HTTP verification against DUNGEONS_API_URL authenticated with BEYOND_IDENTITY_SECRET.
+ * - Overworld does NOT independently verify Dungeons passwords or store duplicate password tables.
+ * - Server-to-server HTTP authentication and account creation against DUNGEONS_API_URL authenticated
+ *   with BEYOND_IDENTITY_SECRET.
  * - Cryptographic HMAC-SHA256 verification of signed identity assertions, expiry bounds,
- *   and single-use replay protection.
+ *   and PostgreSQL-persistent single-use replay protection.
  */
 export class DungeonsIdentityProvider implements IdentityProvider {
   readonly kind: IdentityProviderKind = 'dungeons';
   private readonly fetchImpl: typeof fetch;
   private readonly timeoutMs: number;
-  private readonly consumedAssertions = new Map<string, number>();
+  private readonly consumeReplay: ReplayConsumerFn;
 
   constructor(
     private readonly config: ResolvedIdentityConfig,
@@ -337,6 +344,10 @@ export class DungeonsIdentityProvider implements IdentityProvider {
   ) {
     this.fetchImpl = options?.fetchImpl ?? globalThis.fetch;
     this.timeoutMs = options?.timeoutMs ?? 5000;
+    this.consumeReplay =
+      options?.consumeReplay ??
+      ((replayKey, accountId, expiresAtMs) =>
+        consumeAssertionReplay(replayKey, accountId, expiresAtMs));
   }
 
   get isConfigured(): boolean {
@@ -516,24 +527,122 @@ export class DungeonsIdentityProvider implements IdentityProvider {
     }
   }
 
-  async registerAccount(): Promise<IdentityVerificationResult> {
-    if (!this.isConfigured) {
+  async registerAccount(params: {
+    username: string;
+    password: string;
+    preferredClass: HeroClassId;
+  }): Promise<IdentityVerificationResult> {
+    if (!this.isConfigured || !this.config.dungeonsApiUrl || !this.config.identitySecret) {
       return {
         ok: false,
         provider: this.kind,
         code: 'EXTERNAL_PROVIDER_NOT_CONFIGURED',
-        error: 'Beyond: Dungeons external identity provider is not configured.',
+        error:
+          'Beyond: Dungeons external identity provider is not configured (set DUNGEONS_API_URL and BEYOND_IDENTITY_SECRET).',
       };
     }
 
-    // Overworld must not create duplicate permanent accounts when Dungeons is authoritative.
-    return {
-      ok: false,
-      provider: this.kind,
-      code: 'EXTERNAL_ACCOUNT_OWNED_BY_DUNGEONS',
-      error:
-        'Permanent Beyond accounts must be created in Beyond: Dungeons.',
-    };
+    const endpoint = `${this.config.dungeonsApiUrl}/api/internal/identity/register`;
+    const body = JSON.stringify({
+      username: params.username.trim(),
+      password: params.password,
+      preferredClass: params.preferredClass,
+      heroClass: params.preferredClass,
+    });
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+
+    try {
+      const response = await this.fetchImpl(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          Authorization: `Bearer ${this.config.identitySecret}`,
+          'X-Beyond-Identity-Secret': this.config.identitySecret,
+          'X-Beyond-Service': 'beyond-overworld',
+        },
+        body,
+        signal: controller.signal,
+      });
+
+      let payload: Record<string, unknown> | null = null;
+      try {
+        payload = (await response.json()) as Record<string, unknown>;
+      } catch {
+        payload = null;
+      }
+
+      if (response.status === 409) {
+        return {
+          ok: false,
+          provider: this.kind,
+          code: 'ACCOUNT_EXISTS',
+          error:
+            typeof payload?.error === 'string'
+              ? payload.error
+              : 'That adventurer name is already claimed.',
+        };
+      }
+
+      if (response.status === 400) {
+        return {
+          ok: false,
+          provider: this.kind,
+          code: 'INVALID_REGISTRATION',
+          error:
+            typeof payload?.error === 'string'
+              ? payload.error
+              : 'Invalid account registration payload.',
+        };
+      }
+
+      if (!response.ok || !payload) {
+        return {
+          ok: false,
+          provider: this.kind,
+          code: 'DUNGEONS_AUTH_ERROR',
+          error:
+            typeof payload?.error === 'string'
+              ? payload.error
+              : `Beyond: Dungeons account registration failed (${response.status}).`,
+        };
+      }
+
+      if (typeof payload.assertion === 'string') {
+        return this.verifySignedAssertion(payload.assertion);
+      }
+
+      const rawIdentity = payload.identity ?? payload.account ?? payload.user;
+      const parsedIdentity = SharedAccountIdentitySchema.safeParse(rawIdentity);
+      if (!parsedIdentity.success) {
+        return {
+          ok: false,
+          provider: this.kind,
+          code: 'INVALID_DUNGEONS_RESPONSE',
+          error: 'Beyond: Dungeons returned an invalid registration response.',
+        };
+      }
+
+      return {
+        ok: true,
+        provider: this.kind,
+        identity: parsedIdentity.data,
+      };
+    } catch (err) {
+      const isTimeout = err instanceof Error && err.name === 'AbortError';
+      return {
+        ok: false,
+        provider: this.kind,
+        code: isTimeout ? 'DUNGEONS_TIMEOUT' : 'DUNGEONS_UNREACHABLE',
+        error: isTimeout
+          ? 'Beyond: Dungeons registration service timed out.'
+          : 'Beyond: Dungeons identity service is currently unreachable.',
+      };
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   async verifySignedAssertion(assertionToken: string): Promise<IdentityVerificationResult> {
@@ -624,14 +733,13 @@ export class DungeonsIdentityProvider implements IdentityProvider {
       }
     }
 
-    // Replay protection: consume unique jti (or full assertion SHA-256 digest) until expiry
-    this.pruneExpiredReplays(nowMs);
+    // Persistent replay protection: atomically record jti (or SHA-256 digest) in PostgreSQL until expiry
     const replayKey = parsed.data.jti
       ? `jti:${parsed.data.jti}`
       : `tok:${createHash('sha256').update(normalizedToken).digest('hex')}`;
 
-    const priorExpiry = this.consumedAssertions.get(replayKey);
-    if (priorExpiry && priorExpiry > nowMs) {
+    const consumed = await this.consumeReplay(replayKey, parsed.data.accountId, expMs);
+    if (!consumed) {
       return {
         ok: false,
         provider: this.kind,
@@ -639,8 +747,6 @@ export class DungeonsIdentityProvider implements IdentityProvider {
         error: 'Beyond identity assertion has already been redeemed.',
       };
     }
-
-    this.consumedAssertions.set(replayKey, expMs);
 
     return {
       ok: true,
@@ -661,17 +767,5 @@ export class DungeonsIdentityProvider implements IdentityProvider {
         attributePoints: parsed.data.attributePoints,
       },
     };
-  }
-
-  private pruneExpiredReplays(nowMs: number): void {
-    for (const [key, expMs] of this.consumedAssertions) {
-      if (expMs <= nowMs) {
-        this.consumedAssertions.delete(key);
-      }
-    }
-    if (this.consumedAssertions.size >= MAX_REPLAY_ENTRIES) {
-      const oldestKey = this.consumedAssertions.keys().next().value;
-      if (oldestKey) this.consumedAssertions.delete(oldestKey);
-    }
   }
 }

@@ -56,4 +56,10 @@ async function startServer(): Promise<void> {
   });
 }
 
-void startServer();
+startServer().catch((err) => {
+  console.error(
+    '[Server] Fatal startup failure:',
+    err instanceof Error ? err.message : String(err)
+  );
+  process.exit(1);
+});
