@@ -19,28 +19,52 @@ Project Status
 
 Planned
 
-- [ ] Initial client and server foundation.
-- [ ] Database foundation.
-- [ ] Authentication foundation.
-- [ ] Character integration adapter.
-- [ ] Multiplayer WebSocket foundation.
-- [ ] World instance manager.
-- [ ] Server-authoritative movement.
-- [ ] Safe-zone protection.
-- [ ] Open-world PvP foundation.
-- [ ] Arena system.
-- [ ] PvPvE Survival system.
-- [ ] Public event system.
-- [ ] Shared Beyond Universe integration.
+- [x] Initial client and server foundation.
+- [x] Database foundation.
+- [x] Authentication foundation.
+- [x] Character integration adapter.
+- [x] Multiplayer WebSocket foundation.
+- [x] World instance manager.
+- [x] Server-authoritative movement.
+- [x] Safe-zone protection.
+- [ ] Open-world PvP foundation. (Awaiting PvP stat normalization & combat formula approval)
+- [ ] Arena system. (Scaffold boundary only; matchmaking, ranking & Honor formulas awaiting design approval)
+- [ ] PvPvE Survival system. (Scaffold boundary only; session rules & enemy scaling awaiting design approval)
+- [ ] Public event system. (Scaffold boundary only; event types & schedules awaiting design approval)
+- [ ] Shared Beyond Universe integration. (DevCharacterAdapter active; live Beyond API awaiting integration milestone)
 
 Visual Development
 
-- [ ] Audit Beyond: Dungeons visual assets.
-- [ ] Establish Overworld art direction.
-- [ ] Establish reusable character asset references.
-- [ ] Establish environment and tileset references.
-- [ ] Establish animation and visual effect standards.
-- [ ] Establish UI visual standards.
+- [x] Audit Beyond: Dungeons visual assets.
+- [x] Establish Overworld art direction.
+- [x] Establish reusable character asset references.
+- [ ] Establish environment and tileset references. (Foundation stub grid active; final world biome art awaiting approval)
+- [x] Establish animation and visual effect standards.
+- [x] Establish UI visual standards.
+
+---
+
+[0.1.0] — 2026-11-17
+
+Added
+
+- Full-stack React 19 + Vite 6 + Tailwind v4 + Express + `ws` server foundation (`server.ts`, `client/`, `shared/`).
+- Overworld-only PostgreSQL schema and initial migration (`database/schemas/overworld.sql`, `database/migrations/001_initial_overworld.sql`) with in-memory fallback when `DATABASE_URL` is unset and strict isolation from permanent character progression (`DD-027`).
+- Session authentication (`scryptSync` password hashing, 24-hour tokens, HTTP auth routes, WebSocket `Sec-WebSocket-Protocol` handshake).
+- `CharacterIntegrationLayer` (`DevCharacterAdapter`) mirroring `Beyond: Dungeons` classes (`vanguard`, `ranger`, `arcanist`, `cleric`), `MAX_LEVEL = 50`, 5 attributes, and shared `Weapon`/`Vestment` slots (`DD-014`–`DD-015`).
+- `WorldInstanceManager` and `WorldInstance` with `100`-player target shard capacity (`DD-007`), `O(instanceSize)` `InstanceClientIndex`, backpressure protection, 40 Hz (`25ms`) simulation loop, entity-diff delta snapshots, and 15-second disconnect/reconnect grace handling.
+- Deterministic shared movement and wall-sliding collision (`shared/movement/playerMovement.ts`) paired with client sequence-based prediction/reconciliation (`client/src/game/world/prediction.ts`) and a clearly marked non-final **Development Foundation Map**.
+- Server-authoritative Safe-Zone attack blocking (`DD-010`), combat lock (`DD-021`) restricting Armament swaps to Safe Zones outside active combat, and independent per-Tactical-Skill cooldown persistence across unequip/re-equip (`DD-019`, `DD-020`).
+- Isolated placeholder module boundaries for Arena, PvPvE Survival, and Shared Public Events reporting `awaiting_design_approval`.
+
+Visual
+
+- Audited `Beyond: Dungeons` (see `REFERENCE_AUDIT.md`) and integrated verbatim Canvas 2D procedural hero sprites (`heroSprites.ts`, `directionalFacing.ts`, `PixelHeroPreview.tsx`) and `.stone-*` UI theme tokens (`ART_DIRECTION.md`).
+
+Testing
+
+- Vitest foundation suite (`server/tests/foundation.test.ts`): 100-player instance capacity cap & reconnect state preservation, Safe-Zone attack blocking (`DD-010`), non-Safe-Zone attack probes (`DD-011`), independent tactical cooldowns across unequip/re-equip (`DD-020`), active combat / Safe-Zone Armament switch locks (`DD-021`), wall collision & zone detection, entity-diff delta reconstruction, and Zod protocol schema validation.
+- Live WebSocket 100-socket network load benchmark not yet executed.
 
 ---
 
