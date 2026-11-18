@@ -1,3 +1,4 @@
+/// <reference types="vite/client" />
 import React, { useEffect, useRef, useState } from 'react';
 import {
   HERO_CLASSES,
@@ -12,8 +13,20 @@ import {
 } from './OverworldChangelogModal.tsx';
 import { PixelHeroPreview } from './PixelHeroPreview.tsx';
 
+const IS_PROD_BUILD = import.meta.env.PROD;
+
+interface PublicClientAuthConfig {
+  environment: 'production' | 'development';
+  authoritativeProvider: 'local_dev' | 'dungeons';
+  devLoginEnabled: boolean;
+  localRegistrationEnabled: boolean;
+  externalAssertionEnabled: boolean;
+}
+
 interface AuthScreenProps {
   onAuthenticated: (payload: { token: string; character: CharacterIdentity }) => void;
+  externalError?: string | null;
+  exchangingAssertion?: boolean;
 }
 
 type AuthMode = 'login' | 'register';
@@ -23,7 +36,18 @@ type AuthMode = 'login' | 'register';
  * obsidian atmosphere, floating pixel embers, stone-bevel panels, gold CTA,
  * password visibility toggle, and live PixelHeroPreview class selection.
  */
-export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
+export const AuthScreen: React.FC<AuthScreenProps> = ({
+  onAuthenticated,
+  externalError = null,
+  exchangingAssertion = false,
+}) => {
+  const [authConfig, setAuthConfig] = useState<PublicClientAuthConfig>(() => ({
+    environment: IS_PROD_BUILD ? 'production' : 'development',
+    authoritativeProvider: IS_PROD_BUILD ? 'dungeons' : 'local_dev',
+    devLoginEnabled: !IS_PROD_BUILD,
+    localRegistrationEnabled: !IS_PROD_BUILD,
+    externalAssertionEnabled: IS_PROD_BUILD,
+  }));
   const [mode, setMode] = useState<AuthMode>('login');
   const [username, setUsername] = useState(() => {
     try {
@@ -41,6 +65,29 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
 
   const fxCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const latestChangelog = OVERWORLD_CHANGELOG[0];
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/auth/config')
+      .then(async (res) => {
+        if (!res.ok) return null;
+        return (await res.json()) as PublicClientAuthConfig;
+      })
+      .then((cfg) => {
+        if (!cancelled && cfg) {
+          setAuthConfig(cfg);
+          if (!cfg.localRegistrationEnabled) {
+            setMode('login');
+          }
+        }
+      })
+      .catch(() => {
+        // Retain conservative environment defaults if config endpoint is temporarily unreachable
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Subtle floating pixel embers & lantern glow matching Beyond: Dungeons
   useEffect(() => {
@@ -97,11 +144,17 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
   }, []);
 
   const switchMode = (next: AuthMode) => {
+    if (next === 'register' && !authConfig.localRegistrationEnabled) {
+      return;
+    }
     setMode(next);
     setErrorMsg(null);
   };
 
   const fillDevCredentials = () => {
+    if (!authConfig.devLoginEnabled) {
+      return;
+    }
     setMode('login');
     setUsername('wanderer');
     setPassword('wanderer123');
@@ -111,6 +164,12 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMsg(null);
+
+    if (mode === 'register' && !authConfig.localRegistrationEnabled) {
+      setMode('login');
+      setErrorMsg('Accounts are managed in Beyond: Dungeons.');
+      return;
+    }
 
     const trimmedUser = username.trim();
     if (trimmedUser.length < 2) {
@@ -245,12 +304,12 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
           </div>
 
           <form onSubmit={handleSubmit} className="space-y-3.5 pt-1">
-            {errorMsg && (
+            {(errorMsg || externalError) && (
               <div
                 role="status"
                 className="px-3 py-1.5 text-xs font-mono border bg-[#3D2429] border-[#9E424B] text-[#FECACA]"
               >
-                {errorMsg}
+                {errorMsg ?? externalError}
               </div>
             )}
 
@@ -343,8 +402,8 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
               </button>
             </label>
 
-            {/* Shared Class Selection in Register Mode */}
-            {mode === 'register' && (
+            {/* Shared Class Selection in Register Mode (development only) */}
+            {mode === 'register' && authConfig.localRegistrationEnabled && (
               <div className="space-y-2 pt-1">
                 <div className="flex items-center justify-between text-xs">
                   <span className="font-display text-white text-xs sm:text-sm font-semibold">
@@ -421,10 +480,10 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
             <div className="pt-1 flex justify-center">
               <button
                 type="submit"
-                disabled={loading}
+                disabled={loading || exchangingAssertion}
                 className="stone-button stone-button-gold w-full sm:w-[75%] h-14 text-xl"
               >
-                {loading
+                {loading || exchangingAssertion
                   ? 'Connecting...'
                   : mode === 'login'
                   ? 'Log In'
@@ -433,33 +492,41 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
             </div>
           </form>
 
-          {/* Bottom Mode Switch & Dev Quick Fill */}
+          {/* Bottom Mode Switch & Dev Quick Fill (hidden when disabled in production) */}
           <div className="flex flex-wrap items-center justify-center gap-2.5 pt-3">
-            {mode === 'login' ? (
-              <button
-                type="button"
-                onClick={() => switchMode('register')}
-                className="stone-button stone-button-dark text-[10px] sm:text-xs py-1"
-              >
-                &gt; Create Account
-              </button>
+            {authConfig.localRegistrationEnabled ? (
+              mode === 'login' ? (
+                <button
+                  type="button"
+                  onClick={() => switchMode('register')}
+                  className="stone-button stone-button-dark text-[10px] sm:text-xs py-1"
+                >
+                  &gt; Create Account
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => switchMode('login')}
+                  className="stone-button stone-button-dark text-[10px] sm:text-xs py-1"
+                >
+                  &gt; Back to Log In
+                </button>
+              )
             ) : (
+              <p className="text-[11px] font-mono text-[#A19FAF] text-center">
+                Sign in with your Beyond: Dungeons account.
+              </p>
+            )}
+            {authConfig.devLoginEnabled && (
               <button
                 type="button"
-                onClick={() => switchMode('login')}
-                className="stone-button stone-button-dark text-[10px] sm:text-xs py-1"
+                onClick={fillDevCredentials}
+                className="stone-button stone-button-dark text-[10px] sm:text-xs py-1 text-[#FCD34D]"
+                title="Fill development convenience credentials (wanderer)"
               >
-                &gt; Back to Log In
+                Dev Login
               </button>
             )}
-            <button
-              type="button"
-              onClick={fillDevCredentials}
-              className="stone-button stone-button-dark text-[10px] sm:text-xs py-1 text-[#FCD34D]"
-              title="Fill development convenience credentials (wanderer)"
-            >
-              Dev Login
-            </button>
           </div>
         </section>
 

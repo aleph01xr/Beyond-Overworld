@@ -17,6 +17,10 @@ export const AuthRegisterSchema = z.object({
   heroClass: HeroClassSchema.default('vanguard'),
 });
 
+export const ExternalAssertionSchema = z.object({
+  assertion: z.string().trim().min(10, 'Signed identity assertion is required.').max(8192),
+});
+
 export const PlayerInputSchema = z.object({
   up: z.boolean(),
   down: z.boolean(),

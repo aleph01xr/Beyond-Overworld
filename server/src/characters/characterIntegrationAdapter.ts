@@ -8,8 +8,15 @@ import {
 } from '../../../shared/constants/classes.ts';
 import type {
   CharacterIdentity,
+  IdentityProviderKind,
   SharedAccountIdentity,
 } from '../../../shared/types/domain.ts';
+import {
+  getOverworldCharacterLink,
+  updateOverworldCharacterArmament,
+  updateOverworldCharacterHonor,
+  upsertOverworldCharacterLink,
+} from '../persistence/database.ts';
 
 export interface ArmamentUpdateResult {
   ok: boolean;
@@ -22,6 +29,8 @@ export interface ArmamentUpdateResult {
  * character service (ARCHITECTURE.md Section 12, DD-002, DD-027).
  *
  * Beyond: Overworld must NEVER maintain a competing permanent progression database.
+ * Overworld-only progression (such as Arena Honor and persistent character_id linking)
+ * is stored in `overworld_character_links` and preserved across authoritative syncs.
  */
 export interface CharacterIntegrationLayer {
   getCharacterByAccountId(accountId: string): Promise<CharacterIdentity | null>;
@@ -33,7 +42,10 @@ export interface CharacterIntegrationLayer {
     lockedClass?: HeroClassId;
     isAdmin?: boolean;
   }): Promise<CharacterIdentity>;
-  syncAuthoritativeIdentity(identity: SharedAccountIdentity): Promise<CharacterIdentity>;
+  syncAuthoritativeIdentity(
+    identity: SharedAccountIdentity,
+    provider?: IdentityProviderKind
+  ): Promise<CharacterIdentity>;
   updateEquippedArmament(params: {
     accountId: string;
     slot: ArmamentSlot;
@@ -42,17 +54,43 @@ export interface CharacterIntegrationLayer {
   addArenaHonor(accountId: string, delta: number): Promise<CharacterIdentity | null>;
 }
 
+function isCompatibleArmamentItem(
+  itemId: string | null | undefined,
+  slot: ArmamentSlot,
+  heroClass: HeroClassId
+): itemId is string {
+  if (!itemId) return false;
+  const def = BASE_ARMAMENTS[itemId];
+  return Boolean(def && def.slot === slot && def.compatibleClasses.includes(heroClass));
+}
+
 /**
- * Local development adapter simulating the future Beyond Universe shared character API.
- * Enforces exact Beyond: Dungeons class/level/attribute/Armament schemas (DD-014..DD-015)
- * and syncs authoritative identity records keyed by accountId.
+ * Shared Character Integration Adapter enforcing Beyond: Dungeons class/level/attribute/Armament
+ * schemas (DD-014..DD-015) while persisting account-to-character links and Overworld Honor
+ * via `overworld_character_links` without duplicating or overwriting permanent Dungeons progression.
  */
 export class DevCharacterAdapter implements CharacterIntegrationLayer {
   private readonly charactersByAccount = new Map<string, CharacterIdentity>();
 
+  constructor(private readonly options?: { persistLinks?: boolean }) {}
+
+  private get shouldPersistLinks(): boolean {
+    return this.options?.persistLinks !== false;
+  }
+
   async getCharacterByAccountId(accountId: string): Promise<CharacterIdentity | null> {
     const existing = this.charactersByAccount.get(accountId);
-    return existing ? structuredClone(existing) : null;
+    if (!existing) return null;
+
+    if (this.shouldPersistLinks) {
+      const link = await getOverworldCharacterLink(accountId);
+      if (link) {
+        existing.characterId = link.characterId;
+        existing.arenaHonor = Math.max(existing.arenaHonor, link.arenaHonor);
+      }
+    }
+
+    return structuredClone(existing);
   }
 
   async createCharacterForAccount(params: {
@@ -68,10 +106,42 @@ export class DevCharacterAdapter implements CharacterIntegrationLayer {
 
     const lockedClass = params.lockedClass ?? params.heroClass;
     const preferredClass = params.preferredClass ?? params.heroClass;
+    const persistedLink = this.shouldPersistLinks
+      ? await getOverworldCharacterLink(params.accountId)
+      : null;
+
+    const characterId = persistedLink?.characterId ?? `char_${randomUUID()}`;
+    const arenaHonor = persistedLink?.arenaHonor ?? 0;
+
+    const weaponId =
+      persistedLink &&
+      (persistedLink.equippedWeaponId === null ||
+        isCompatibleArmamentItem(persistedLink.equippedWeaponId, 'weapon', lockedClass))
+        ? persistedLink.equippedWeaponId
+        : getDefaultWeaponId(lockedClass);
+
+    const vestmentId =
+      persistedLink &&
+      (persistedLink.equippedVestmentId === null ||
+        isCompatibleArmamentItem(persistedLink.equippedVestmentId, 'vestment', lockedClass))
+        ? persistedLink.equippedVestmentId
+        : getDefaultVestmentId(lockedClass);
+
+    if (this.shouldPersistLinks) {
+      await upsertOverworldCharacterLink({
+        accountId: params.accountId,
+        characterId,
+        identityProvider: 'local_dev',
+        arenaHonor,
+        equippedWeaponId: weaponId,
+        equippedVestmentId: vestmentId,
+        lastKnownUsername: params.username,
+      });
+    }
 
     const created: CharacterIdentity = {
       accountId: params.accountId,
-      characterId: `char_${randomUUID()}`,
+      characterId,
       username: params.username,
       heroClass: lockedClass,
       preferredClass,
@@ -87,11 +157,11 @@ export class DevCharacterAdapter implements CharacterIntegrationLayer {
       },
       attributePoints: 0,
       equippedArmament: {
-        weaponId: getDefaultWeaponId(lockedClass),
-        vestmentId: getDefaultVestmentId(lockedClass),
+        weaponId,
+        vestmentId,
       },
       permanentUnlocks: [],
-      arenaHonor: 0,
+      arenaHonor,
       isAdmin: params.isAdmin === true,
     };
 
@@ -99,20 +169,94 @@ export class DevCharacterAdapter implements CharacterIntegrationLayer {
     return structuredClone(created);
   }
 
+  /**
+   * Synchronizes authoritative Dungeons / provider fields keyed by accountId while
+   * preserving existing Overworld-owned progression (persistent characterId, Arena Honor,
+   * and compatible Overworld Armament selections).
+   */
   async syncAuthoritativeIdentity(
-    identity: SharedAccountIdentity
+    identity: SharedAccountIdentity,
+    provider: IdentityProviderKind = 'dungeons'
   ): Promise<CharacterIdentity> {
     const existing = this.charactersByAccount.get(identity.accountId);
+    const persistedLink = this.shouldPersistLinks
+      ? await getOverworldCharacterLink(identity.accountId)
+      : null;
+
     const resolvedClass = identity.lockedClass ?? identity.preferredClass;
-    const defaultArmament = {
-      weaponId: getDefaultWeaponId(resolvedClass),
-      vestmentId: getDefaultVestmentId(resolvedClass),
-    };
+    const defaultWeapon = getDefaultWeaponId(resolvedClass);
+    const defaultVestment = getDefaultVestmentId(resolvedClass);
+
+    const preservedWeapon =
+      persistedLink &&
+      (persistedLink.equippedWeaponId === null ||
+        isCompatibleArmamentItem(persistedLink.equippedWeaponId, 'weapon', resolvedClass))
+        ? persistedLink.equippedWeaponId
+        : existing &&
+            (existing.equippedArmament.weaponId === null ||
+              isCompatibleArmamentItem(
+                existing.equippedArmament.weaponId,
+                'weapon',
+                resolvedClass
+              ))
+          ? existing.equippedArmament.weaponId
+          : defaultWeapon;
+
+    const preservedVestment =
+      persistedLink &&
+      (persistedLink.equippedVestmentId === null ||
+        isCompatibleArmamentItem(persistedLink.equippedVestmentId, 'vestment', resolvedClass))
+        ? persistedLink.equippedVestmentId
+        : existing &&
+            (existing.equippedArmament.vestmentId === null ||
+              isCompatibleArmamentItem(
+                existing.equippedArmament.vestmentId,
+                'vestment',
+                resolvedClass
+              ))
+          ? existing.equippedArmament.vestmentId
+          : defaultVestment;
+
+    const preservedCharacterId =
+      persistedLink?.characterId ??
+      existing?.characterId ??
+      identity.characterId ??
+      `char_${randomUUID()}`;
+
+    // Preserve existing Overworld Arena Honor across authoritative Dungeons re-syncs
+    const preservedHonor = Math.max(
+      0,
+      persistedLink?.arenaHonor ?? 0,
+      existing?.arenaHonor ?? 0,
+      !persistedLink && !existing ? (identity.arenaHonor ?? 0) : 0
+    );
+
+    const linkResult = this.shouldPersistLinks
+      ? await upsertOverworldCharacterLink({
+          accountId: identity.accountId,
+          characterId: preservedCharacterId,
+          identityProvider: provider,
+          arenaHonor: preservedHonor,
+          equippedWeaponId:
+            identity.equippedArmament?.weaponId ?? preservedWeapon,
+          equippedVestmentId:
+            identity.equippedArmament?.vestmentId ?? preservedVestment,
+          lastKnownUsername: identity.username,
+        })
+      : null;
+
+    const finalCharacterId = linkResult?.characterId ?? preservedCharacterId;
+    const finalHonor = linkResult?.arenaHonor ?? preservedHonor;
+    const finalArmament = identity.equippedArmament
+      ? identity.equippedArmament
+      : {
+          weaponId: linkResult ? linkResult.equippedWeaponId : preservedWeapon,
+          vestmentId: linkResult ? linkResult.equippedVestmentId : preservedVestment,
+        };
 
     const synced: CharacterIdentity = {
       accountId: identity.accountId,
-      characterId:
-        identity.characterId ?? existing?.characterId ?? `char_${randomUUID()}`,
+      characterId: finalCharacterId,
       username: identity.username,
       heroClass: resolvedClass,
       preferredClass: identity.preferredClass,
@@ -127,11 +271,10 @@ export class DevCharacterAdapter implements CharacterIntegrationLayer {
         faith: identity.faith,
       },
       attributePoints: identity.attributePoints,
-      equippedArmament:
-        identity.equippedArmament ?? existing?.equippedArmament ?? defaultArmament,
+      equippedArmament: finalArmament,
       permanentUnlocks:
         identity.permanentUnlocks ?? existing?.permanentUnlocks ?? [],
-      arenaHonor: identity.arenaHonor ?? existing?.arenaHonor ?? 0,
+      arenaHonor: finalHonor,
       isAdmin: identity.isAdmin === true,
     };
 
@@ -155,7 +298,10 @@ export class DevCharacterAdapter implements CharacterIntegrationLayer {
         return { ok: false, error: `Unknown Armament item "${params.itemId}".` };
       }
       if (def.slot !== params.slot) {
-        return { ok: false, error: `Item "${def.name}" cannot be equipped in the ${params.slot} slot.` };
+        return {
+          ok: false,
+          error: `Item "${def.name}" cannot be equipped in the ${params.slot} slot.`,
+        };
       }
       if (!def.compatibleClasses.includes(character.heroClass)) {
         return {
@@ -171,13 +317,27 @@ export class DevCharacterAdapter implements CharacterIntegrationLayer {
       character.equippedArmament.vestmentId = params.itemId;
     }
 
+    if (this.shouldPersistLinks) {
+      await updateOverworldCharacterArmament(
+        params.accountId,
+        params.slot,
+        params.itemId
+      );
+    }
+
     return { ok: true, character: structuredClone(character) };
   }
 
   async addArenaHonor(accountId: string, delta: number): Promise<CharacterIdentity | null> {
     const character = this.charactersByAccount.get(accountId);
     if (!character) return null;
-    character.arenaHonor = Math.max(0, character.arenaHonor + Math.trunc(delta));
+    const nextBalance = Math.max(0, character.arenaHonor + Math.trunc(delta));
+    character.arenaHonor = nextBalance;
+
+    if (this.shouldPersistLinks) {
+      await updateOverworldCharacterHonor(accountId, nextBalance);
+    }
+
     return structuredClone(character);
   }
 }

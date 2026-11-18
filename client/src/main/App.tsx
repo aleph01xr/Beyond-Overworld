@@ -38,6 +38,8 @@ export const App: React.FC = () => {
   const [chatMessages, setChatMessages] = useState<OverworldChatMessage[]>([]);
   const [pingMs, setPingMs] = useState<number | null>(null);
   const [actionBanner, setActionBanner] = useState<string | null>(null);
+  const [externalAuthError, setExternalAuthError] = useState<string | null>(null);
+  const [exchangingAssertion, setExchangingAssertion] = useState(false);
 
   const networkRef = useRef<OverworldNetworkClient | null>(null);
   const bannerTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -49,6 +51,59 @@ export const App: React.FC = () => {
       setActionBanner(null);
     }, 3200);
   };
+
+  // Exchange signed Beyond: Dungeons identity assertion if handed off via ?assertion=...
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const assertion = params.get('assertion')?.trim();
+    if (!assertion) return;
+
+    params.delete('assertion');
+    const nextSearch = params.toString();
+    const cleanUrl = `${window.location.pathname}${nextSearch ? `?${nextSearch}` : ''}${window.location.hash}`;
+    window.history.replaceState({}, '', cleanUrl);
+
+    let cancelled = false;
+    setExchangingAssertion(true);
+    setExternalAuthError(null);
+
+    fetch('/api/auth/external-assertion', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ assertion }),
+    })
+      .then(async (res) => {
+        const data = (await res.json()) as {
+          token?: string;
+          character?: CharacterIdentity;
+          error?: string;
+        };
+        if (!res.ok || !data.token || !data.character) {
+          throw new Error(data.error ?? 'Beyond: Dungeons sign-in verification failed.');
+        }
+        if (!cancelled) {
+          handleAuthenticated({ token: data.token, character: data.character });
+        }
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) {
+          setExternalAuthError(
+            err instanceof Error
+              ? err.message
+              : 'Beyond: Dungeons sign-in verification failed.'
+          );
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setExchangingAssertion(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Validate stored session token on startup
   useEffect(() => {
@@ -169,7 +224,13 @@ export const App: React.FC = () => {
   };
 
   if (!token || !character) {
-    return <AuthScreen onAuthenticated={handleAuthenticated} />;
+    return (
+      <AuthScreen
+        onAuthenticated={handleAuthenticated}
+        externalError={externalAuthError}
+        exchangingAssertion={exchangingAssertion}
+      />
+    );
   }
 
   if (activeSession && networkRef.current) {

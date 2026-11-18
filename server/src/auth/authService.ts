@@ -39,13 +39,28 @@ export interface AuthResult {
 export interface AuthServiceOptions {
   env?: Record<string, string | undefined>;
   seedDevAccount?: boolean;
+  isProduction?: boolean;
+  fetchImpl?: typeof fetch;
+  timeoutMs?: number;
 }
 
 export interface IdentityProviderStatusSummary {
+  environment: 'production' | 'development';
+  authoritativeProvider: IdentityProviderKind;
   activeLocalProvider: IdentityProviderKind;
   externalProviderConfigured: boolean;
   externalProviderOperational: boolean;
+  devLoginEnabled: boolean;
+  localRegistrationEnabled: boolean;
   externalConfig: PublicIdentityConfigStatus;
+}
+
+export interface PublicClientAuthConfig {
+  environment: 'production' | 'development';
+  authoritativeProvider: IdentityProviderKind;
+  devLoginEnabled: boolean;
+  localRegistrationEnabled: boolean;
+  externalAssertionEnabled: boolean;
 }
 
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
@@ -60,16 +75,22 @@ export class AuthService {
     private readonly characterAdapter: CharacterIntegrationLayer,
     options?: AuthServiceOptions
   ) {
-    this.identityConfig = resolveIdentityConfig(options?.env ?? process.env);
-    this.localProvider = new LocalIdentityProvider({
-      seedDevAccount: options?.seedDevAccount,
+    this.identityConfig = resolveIdentityConfig(options?.env ?? process.env, {
+      isProduction: options?.isProduction,
     });
-    this.externalProvider = new DungeonsIdentityProvider(this.identityConfig);
+    this.localProvider = new LocalIdentityProvider({
+      enabled: !this.identityConfig.isProduction,
+      seedDevAccount:
+        !this.identityConfig.isProduction && (options?.seedDevAccount ?? true),
+    });
+    this.externalProvider = new DungeonsIdentityProvider(this.identityConfig, {
+      fetchImpl: options?.fetchImpl,
+      timeoutMs: options?.timeoutMs,
+    });
 
     console.log(`[Auth] ${this.identityConfig.diagnosticMessage}`);
 
-    // Ensure the seeded local dev character exists when enabled
-    if (options?.seedDevAccount ?? process.env.NODE_ENV !== 'production') {
+    if (!this.identityConfig.isProduction && (options?.seedDevAccount ?? true)) {
       void this.ensureDevSeedCharacter();
     }
   }
@@ -80,19 +101,47 @@ export class AuthService {
       'wanderer123'
     );
     if (devLogin.ok && devLogin.identity) {
-      await this.characterAdapter.syncAuthoritativeIdentity(devLogin.identity);
+      await this.characterAdapter.syncAuthoritativeIdentity(
+        devLogin.identity,
+        'local_dev'
+      );
     }
   }
 
   /**
-   * Returns sanitized configuration state (never includes BEYOND_IDENTITY_SECRET).
+   * Returns sanitized configuration state (never includes BEYOND_IDENTITY_SECRET or internal URLs).
    */
   getIdentityProviderStatus(): IdentityProviderStatusSummary {
     return {
+      environment: this.identityConfig.isProduction ? 'production' : 'development',
+      authoritativeProvider: this.identityConfig.isProduction
+        ? 'dungeons'
+        : this.externalProvider.isConfigured
+          ? 'dungeons'
+          : 'local_dev',
       activeLocalProvider: this.localProvider.kind,
       externalProviderConfigured: this.externalProvider.isConfigured,
       externalProviderOperational: this.externalProvider.isOperational,
+      devLoginEnabled: this.identityConfig.devLoginEnabled,
+      localRegistrationEnabled: this.identityConfig.localRegistrationEnabled,
       externalConfig: toPublicIdentityConfigStatus(this.identityConfig),
+    };
+  }
+
+  /**
+   * Safe public capability flags exposed to the browser AuthScreen via GET /api/auth/config.
+   */
+  getPublicClientAuthConfig(): PublicClientAuthConfig {
+    return {
+      environment: this.identityConfig.isProduction ? 'production' : 'development',
+      authoritativeProvider: this.identityConfig.isProduction
+        ? 'dungeons'
+        : this.externalProvider.isConfigured
+          ? 'dungeons'
+          : 'local_dev',
+      devLoginEnabled: this.identityConfig.devLoginEnabled,
+      localRegistrationEnabled: this.identityConfig.localRegistrationEnabled,
+      externalAssertionEnabled: this.externalProvider.isConfigured,
     };
   }
 
@@ -101,8 +150,7 @@ export class AuthService {
   }
 
   /**
-   * Server-side seed helper for tests verifying server-authoritative admin privileges
-   * without trusting usernames or client-submitted flags.
+   * Server-side seed helper for dev/test verification of server-authoritative admin privileges.
    */
   async seedLocalAccountForTest(params: {
     accountId: string;
@@ -111,8 +159,11 @@ export class AuthService {
     preferredClass?: HeroClassId;
     isAdmin?: boolean;
   }): Promise<CharacterIdentity> {
+    if (this.identityConfig.isProduction) {
+      throw new Error('Cannot seed local accounts in production mode.');
+    }
     const identity = this.localProvider.seedAccountInternal(params);
-    return this.characterAdapter.syncAuthoritativeIdentity(identity);
+    return this.characterAdapter.syncAuthoritativeIdentity(identity, 'local_dev');
   }
 
   async register(
@@ -120,6 +171,18 @@ export class AuthService {
     password: string,
     heroClass: HeroClassId
   ): Promise<AuthResult> {
+    if (this.identityConfig.isProduction) {
+      const denied = await this.externalProvider.registerAccount();
+      return {
+        ok: false,
+        provider: 'dungeons',
+        code: 'LOCAL_REGISTRATION_DISABLED',
+        error:
+          denied.error ??
+          'Account registration is managed exclusively by Beyond: Dungeons in production.',
+      };
+    }
+
     const verification = await this.localProvider.registerAccount({
       username: usernameRaw,
       password,
@@ -142,6 +205,57 @@ export class AuthService {
   }
 
   async login(usernameRaw: string, password: string): Promise<AuthResult> {
+    // In production, Beyond: Dungeons is strictly the sole identity provider with zero local fallback.
+    if (this.identityConfig.isProduction) {
+      const externalResult = await this.externalProvider.authenticateWithCredentials(
+        usernameRaw,
+        password
+      );
+      if (!externalResult.ok || !externalResult.identity) {
+        return {
+          ok: false,
+          provider: 'dungeons',
+          code: externalResult.code ?? 'EXTERNAL_AUTH_FAILED',
+          error: externalResult.error ?? 'Invalid Beyond: Dungeons credentials.',
+        };
+      }
+      return this.createAuthorizedSessionResult(
+        externalResult.identity,
+        'dungeons'
+      );
+    }
+
+    // In development, if Dungeons external provider is configured, attempt Dungeons first
+    // and only fall back to local dev accounts if Dungeons is unreachable or credentialed locally.
+    if (this.externalProvider.isConfigured) {
+      const externalResult = await this.externalProvider.authenticateWithCredentials(
+        usernameRaw,
+        password
+      );
+      if (externalResult.ok && externalResult.identity) {
+        return this.createAuthorizedSessionResult(
+          externalResult.identity,
+          'dungeons'
+        );
+      }
+      const localFallback = await this.localProvider.authenticateWithCredentials(
+        usernameRaw,
+        password
+      );
+      if (localFallback.ok && localFallback.identity) {
+        return this.createAuthorizedSessionResult(
+          localFallback.identity,
+          'local_dev'
+        );
+      }
+      return {
+        ok: false,
+        provider: 'dungeons',
+        code: externalResult.code ?? 'INVALID_CREDENTIALS',
+        error: externalResult.error ?? 'Invalid username or password.',
+      };
+    }
+
     const verification = await this.localProvider.authenticateWithCredentials(
       usernameRaw,
       password
@@ -163,9 +277,9 @@ export class AuthService {
   }
 
   /**
-   * Entry point prepared for future Beyond: Dungeons signed identity assertions.
-   * Overworld validates cryptographic signature + payload server-side via BEYOND_IDENTITY_SECRET,
-   * syncs character state keyed by Dungeons' authoritative accountId, and issues its own session.
+   * Verifies a signed identity assertion issued by Beyond: Dungeons,
+   * validates signature + expiry + replay protection, syncs authoritative character
+   * state while preserving Overworld Honor, and issues a server-verified Overworld session.
    */
   async authenticateExternalAssertion(assertionToken: string): Promise<AuthResult> {
     const verification = await this.externalProvider.verifySignedAssertion(
@@ -198,7 +312,7 @@ export class AuthService {
     );
     if (!character) return null;
 
-    // Ensure returned character never diverges from session's authoritative isAdmin flag
+    // Administrator privileges come exclusively from the authoritative session identity
     character.isAdmin = session.isAdmin;
     return { session, character };
   }
@@ -222,13 +336,19 @@ export class AuthService {
     identity: SharedAccountIdentity,
     provider: IdentityProviderKind
   ): Promise<AuthResult> {
-    const character = await this.characterAdapter.syncAuthoritativeIdentity(identity);
-    character.isAdmin = identity.isAdmin === true;
+    const character = await this.characterAdapter.syncAuthoritativeIdentity(
+      identity,
+      provider
+    );
+
+    // Ensure admin status comes exclusively from authoritative Dungeons / server provider record
+    const authoritativeIsAdmin = identity.isAdmin === true;
+    character.isAdmin = authoritativeIsAdmin;
 
     const token = this.issueSession({
       accountId: identity.accountId,
       username: identity.username,
-      isAdmin: identity.isAdmin === true,
+      isAdmin: authoritativeIsAdmin,
       provider,
     });
 
@@ -236,7 +356,7 @@ export class AuthService {
       ok: true,
       token,
       character,
-      isAdmin: identity.isAdmin === true,
+      isAdmin: authoritativeIsAdmin,
       provider,
     };
   }
