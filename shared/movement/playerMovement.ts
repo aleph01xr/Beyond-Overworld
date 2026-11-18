@@ -151,7 +151,7 @@ export function normalizePlayerInputDirection(
   if (
     typeof input.stickX === 'number' &&
     typeof input.stickY === 'number' &&
-    (Math.abs(input.stickX) > 0.05 || Math.abs(input.stickY) > 0.05)
+    Math.hypot(input.stickX, input.stickY) > 0.05
   ) {
     const len = Math.hypot(input.stickX, input.stickY);
     const clampedLen = Math.min(1, len);
@@ -176,7 +176,7 @@ export function hasMovementInput(
   if (
     typeof input.stickX === 'number' &&
     typeof input.stickY === 'number' &&
-    (Math.abs(input.stickX) > 0.05 || Math.abs(input.stickY) > 0.05)
+    Math.hypot(input.stickX, input.stickY) > 0.05
   ) {
     return true;
   }

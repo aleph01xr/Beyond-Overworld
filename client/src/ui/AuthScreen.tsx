@@ -1,45 +1,134 @@
-import React, { useState } from 'react';
-import { Shield, Swords, Sparkles, Sun, LogIn, UserPlus } from 'lucide-react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   HERO_CLASSES,
-  HERO_CLASS_LIST,
+  MAX_LEVEL,
   type HeroClassId,
 } from '../../../shared/constants/classes.ts';
 import type { CharacterIdentity } from '../../../shared/types/domain.ts';
+import {
+  FullChangelogModal,
+  OVERWORLD_CHANGELOG,
+  OverworldChangelogPanel,
+} from './OverworldChangelogModal.tsx';
 import { PixelHeroPreview } from './PixelHeroPreview.tsx';
 
 interface AuthScreenProps {
   onAuthenticated: (payload: { token: string; character: CharacterIdentity }) => void;
 }
 
-const CLASS_ICON_MAP: Record<HeroClassId, React.ReactNode> = {
-  vanguard: <Shield className="w-4 h-4 text-amber-300" />,
-  ranger: <Swords className="w-4 h-4 text-emerald-300" />,
-  arcanist: <Sparkles className="w-4 h-4 text-indigo-300" />,
-  cleric: <Sun className="w-4 h-4 text-yellow-200" />,
-};
+type AuthMode = 'login' | 'register';
 
+/**
+ * AuthScreen visually aligned with Beyond: Dungeons' LoginScreen.tsx:
+ * obsidian atmosphere, floating pixel embers, stone-bevel panels, gold CTA,
+ * password visibility toggle, and live PixelHeroPreview class selection.
+ */
 export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
-  const [mode, setMode] = useState<'login' | 'register'>('login');
-  const [username, setUsername] = useState('');
+  const [mode, setMode] = useState<AuthMode>('login');
+  const [username, setUsername] = useState(() => {
+    try {
+      return localStorage.getItem('beyond_last_username') || '';
+    } catch {
+      return '';
+    }
+  });
   const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
   const [heroClass, setHeroClass] = useState<HeroClassId>('vanguard');
-  const [error, setError] = useState<string | null>(null);
-  const [submitting, setSubmitting] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [showFullChangelog, setShowFullChangelog] = useState(false);
 
-  const selectedDef = HERO_CLASSES[heroClass];
+  const fxCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const latestChangelog = OVERWORLD_CHANGELOG[0];
+
+  // Subtle floating pixel embers & lantern glow matching Beyond: Dungeons
+  useEffect(() => {
+    const canvas = fxCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    let w = (canvas.width = window.innerWidth);
+    let h = (canvas.height = window.innerHeight);
+    const onResize = () => {
+      w = canvas.width = window.innerWidth;
+      h = canvas.height = window.innerHeight;
+    };
+    window.addEventListener('resize', onResize);
+
+    const motes = Array.from({ length: 18 }, () => ({
+      x: Math.random() * w,
+      y: Math.random() * h,
+      vx: (Math.random() - 0.5) * 12,
+      vy: -8 - Math.random() * 16,
+      size: Math.random() < 0.4 ? 3 : 2,
+      phase: Math.random() * Math.PI * 2,
+    }));
+
+    let rafId = 0;
+    let last = performance.now();
+    const loop = (now: number) => {
+      const dt = Math.min(0.05, (now - last) / 1000);
+      last = now;
+      ctx.clearRect(0, 0, w, h);
+
+      for (const m of motes) {
+        m.x += m.vx * dt;
+        m.y += m.vy * dt;
+        if (m.y < -10) {
+          m.y = h + 10;
+          m.x = Math.random() * w;
+        }
+        if (m.x < -10) m.x = w + 10;
+        if (m.x > w + 10) m.x = -10;
+        const alpha = 0.25 + 0.35 * (0.5 + 0.5 * Math.sin(now * 0.003 + m.phase));
+        ctx.fillStyle = `rgba(254, 215, 110, ${alpha.toFixed(3)})`;
+        ctx.fillRect(Math.round(m.x), Math.round(m.y), m.size, m.size);
+      }
+      rafId = requestAnimationFrame(loop);
+    };
+
+    rafId = requestAnimationFrame(loop);
+    return () => {
+      cancelAnimationFrame(rafId);
+      window.removeEventListener('resize', onResize);
+    };
+  }, []);
+
+  const switchMode = (next: AuthMode) => {
+    setMode(next);
+    setErrorMsg(null);
+  };
+
+  const fillDevCredentials = () => {
+    setMode('login');
+    setUsername('wanderer');
+    setPassword('wanderer123');
+    setErrorMsg(null);
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    setError(null);
-    setSubmitting(true);
+    setErrorMsg(null);
 
+    const trimmedUser = username.trim();
+    if (trimmedUser.length < 2) {
+      setErrorMsg('Enter a username (at least 2 characters).');
+      return;
+    }
+    if (password.length < 8) {
+      setErrorMsg('Enter a password (at least 8 characters).');
+      return;
+    }
+
+    setLoading(true);
     try {
       const endpoint = mode === 'login' ? '/api/auth/login' : '/api/auth/register';
       const body =
         mode === 'login'
-          ? { username, password }
-          : { username, password, heroClass };
+          ? { username: trimmedUser, password }
+          : { username: trimmedUser, password, heroClass };
 
       const res = await fetch(endpoint, {
         method: 'POST',
@@ -54,235 +143,337 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
       };
 
       if (!res.ok || !data.token || !data.character) {
-        setError(data.error ?? 'Authentication failed.');
+        setErrorMsg(data.error ?? 'Authentication failed.');
         return;
+      }
+
+      try {
+        localStorage.setItem('beyond_last_username', data.character.username);
+      } catch {
+        // ignore storage restrictions
       }
 
       onAuthenticated({ token: data.token, character: data.character });
     } catch {
-      setError('Unable to reach Beyond: Overworld server.');
+      setErrorMsg('Unable to reach Beyond: Overworld server.');
     } finally {
-      setSubmitting(false);
+      setLoading(false);
     }
   };
 
-  const fillDevCredentials = () => {
-    setMode('login');
-    setUsername('wanderer');
-    setPassword('wanderer123');
-    setError(null);
-  };
+  const headerTitle = mode === 'login' ? 'Log In' : 'Create Account';
 
   return (
-    <div className="min-h-screen w-full bg-[#181820] flex items-center justify-center p-4 overflow-y-auto">
-      <div className="w-full max-w-4xl grid grid-cols-1 lg:grid-cols-12 gap-5 items-stretch">
-        {/* Left: Auth Form */}
-        <div className="lg:col-span-5 stone-panel rounded-sm p-6 flex flex-col justify-between">
-          <div>
-            <div className="border-b border-[#34313d] pb-4 mb-5">
-              <p className="text-[11px] uppercase tracking-[0.2em] text-[#d9aa52] font-semibold">
-                Beyond Universe
-              </p>
-              <h1 className="font-display text-3xl text-[#f5f1e8] mt-1 tracking-wide">
-                Beyond: Overworld
-              </h1>
-              <p className="text-xs text-[#b8b4c4] mt-1 leading-relaxed">
-                Enter shared multiplayer instances with your persistent Beyond character identity.
-              </p>
-            </div>
+    <main className="relative min-h-screen w-screen overflow-x-hidden overflow-y-auto select-none bg-[#0B0A12] flex flex-col items-center justify-start sm:justify-center p-3 sm:p-6 py-6 sm:py-10 pb-safe pt-safe">
+      {/* Deep atmospheric dark fantasy background gradients */}
+      <div
+        aria-hidden="true"
+        className="fixed inset-0 bg-[radial-gradient(circle_at_50%_35%,_#231F33_0%,_#12101B_55%,_#08070D_100%)] pointer-events-none"
+      />
+      <div
+        aria-hidden="true"
+        className="fixed inset-0 bg-[radial-gradient(ellipse_at_top,_rgba(217,170,82,0.08)_0%,_transparent_60%)] pointer-events-none"
+      />
+      <div
+        aria-hidden="true"
+        className="fixed inset-0 bg-[radial-gradient(ellipse_at_bottom,_rgba(79,70,229,0.06)_0%,_transparent_70%)] pointer-events-none"
+      />
+      <div
+        aria-hidden="true"
+        className="fixed inset-0 bg-[radial-gradient(circle_at_50%_50%,_transparent_40%,_#050408_95%)] pointer-events-none"
+      />
 
-            <div className="grid grid-cols-2 gap-2 mb-5">
-              <button
-                type="button"
-                onClick={() => {
-                  setMode('login');
-                  setError(null);
-                }}
-                className={`stone-button py-2 px-3 rounded-sm text-xs font-semibold flex items-center justify-center gap-1.5 ${
-                  mode === 'login' ? 'stone-button-gold' : ''
-                }`}
-              >
-                <LogIn className="w-3.5 h-3.5" />
-                Sign In
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setMode('register');
-                  setError(null);
-                }}
-                className={`stone-button py-2 px-3 rounded-sm text-xs font-semibold flex items-center justify-center gap-1.5 ${
-                  mode === 'register' ? 'stone-button-gold' : ''
-                }`}
-              >
-                <UserPlus className="w-3.5 h-3.5" />
-                Create Account
-              </button>
-            </div>
+      {/* Floating pixel embers */}
+      <canvas
+        ref={fxCanvasRef}
+        aria-hidden="true"
+        className="fixed inset-0 pointer-events-none"
+      />
 
-            <form onSubmit={handleSubmit} className="space-y-4">
-              <div>
-                <label className="block text-xs font-semibold text-[#d2cedc] mb-1.5">
-                  Adventurer Name
-                </label>
-                <input
-                  type="text"
-                  value={username}
-                  onChange={(e) => setUsername(e.target.value)}
-                  placeholder="2–20 characters"
-                  required
-                  minLength={2}
-                  maxLength={20}
-                  className="stone-input w-full px-3 py-2 rounded-sm text-sm"
-                />
-              </div>
+      {/* Top Atmospheric Title & Update Log Header */}
+      <header className="relative z-10 w-full max-w-5xl mx-auto flex items-center justify-between gap-3 mb-8 sm:mb-10 shrink-0">
+        <div className="flex items-center gap-2 sm:gap-3">
+          <h1 className="font-display text-2xl sm:text-3xl font-bold tracking-wider text-[#F5F5F7] drop-shadow-[0_2px_0_#2F2E3A] whitespace-nowrap">
+            BEYOND
+          </h1>
+          <span className="hidden sm:inline-block text-[11px] font-mono text-[#D9AA52] px-2 py-0.5 border border-[#85632E] bg-[#252336]/90 shadow-sm whitespace-nowrap">
+            OVERWORLD MULTIPLAYER
+          </span>
+        </div>
 
-              <div>
-                <label className="block text-xs font-semibold text-[#d2cedc] mb-1.5">
-                  Password
-                </label>
-                <input
-                  type="password"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  placeholder="Minimum 8 characters"
-                  required
-                  minLength={8}
-                  className="stone-input w-full px-3 py-2 rounded-sm text-sm"
-                />
-              </div>
+        <button
+          type="button"
+          onClick={() => setShowFullChangelog(true)}
+          className="stone-button stone-button-dark py-1.5 px-3 text-[11px] font-mono flex items-center gap-2 cursor-pointer hover:border-[#D9AA52] transition-colors whitespace-nowrap"
+          title="Open Overworld patch archive"
+        >
+          <span className="text-[#FCD34D] font-bold">v{latestChangelog.version}</span>
+          <span className="hidden md:inline text-[#A19FAF]">UPDATE LOG</span>
+        </button>
+      </header>
 
-              {mode === 'register' && (
-                <div>
-                  <label className="block text-xs font-semibold text-[#d2cedc] mb-1.5">
-                    Shared Class Identity
-                  </label>
-                  <div className="grid grid-cols-2 gap-2">
-                    {HERO_CLASS_LIST.map((def) => (
-                      <button
-                        key={def.id}
-                        type="button"
-                        onClick={() => setHeroClass(def.id)}
-                        className={`stone-plaque px-2.5 py-2 rounded-sm text-left flex items-center gap-2 transition-colors ${
-                          heroClass === def.id
-                            ? 'border-[#d9aa52] bg-[#2f2b38]'
-                            : 'hover:border-[#6a6578]'
-                        }`}
-                      >
-                        {CLASS_ICON_MAP[def.id]}
-                        <div>
-                          <div className="font-display text-sm text-[#f5f1e8]">
-                            {def.name}
-                          </div>
-                          <div className="text-[10px] text-[#9b96a8]">
-                            {def.roleBadge}
-                          </div>
-                        </div>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )}
+      {/* Symmetrical Dual Stone Panels: Login/Register + Latest Updates */}
+      <div className="relative z-10 w-full max-w-5xl mx-auto flex flex-col lg:flex-row items-center lg:items-start justify-center gap-8 lg:gap-10 my-auto">
+        {/* Central Chiseled Stone Login Panel */}
+        <section
+          aria-label={headerTitle}
+          className="stone-panel relative z-10 w-full max-w-[440px] p-6 sm:p-7 pt-9 pb-5 shrink-0"
+        >
+          {/* Stone corner chisel details */}
+          <span
+            aria-hidden="true"
+            className="absolute top-1.5 left-1.5 w-2 h-2 border-t-2 border-l-2 border-[#8B8996]/60 pointer-events-none"
+          />
+          <span
+            aria-hidden="true"
+            className="absolute top-1.5 right-1.5 w-2 h-2 border-t-2 border-r-2 border-[#8B8996]/60 pointer-events-none"
+          />
+          <span
+            aria-hidden="true"
+            className="absolute bottom-1.5 left-1.5 w-2 h-2 border-b-2 border-l-2 border-[#393844]/80 pointer-events-none"
+          />
+          <span
+            aria-hidden="true"
+            className="absolute bottom-1.5 right-1.5 w-2 h-2 border-b-2 border-r-2 border-[#393844]/80 pointer-events-none"
+          />
 
-              {error && (
-                <div className="stone-plaque border-red-500/60 bg-red-950/40 px-3 py-2 rounded-sm text-xs text-red-200">
-                  {error}
-                </div>
-              )}
-
-              <button
-                type="submit"
-                disabled={submitting}
-                className="stone-button stone-button-gold w-full py-2.5 rounded-sm font-display text-base tracking-wide"
-              >
-                {submitting
-                  ? 'Connecting...'
-                  : mode === 'login'
-                  ? 'Enter Overworld'
-                  : 'Forge Identity & Enter'}
-              </button>
-            </form>
+          {/* Raised Top Stone Plaque Header */}
+          <div className="stone-plaque absolute -top-5 left-1/2 -translate-x-1/2 px-6 py-1.5 flex items-center justify-center min-w-[190px] sm:min-w-[220px]">
+            <h2 className="font-display text-xl sm:text-2xl font-semibold tracking-wide text-[#F5F5F7] drop-shadow-[0_2px_0_#2F2E3A] whitespace-nowrap">
+              {headerTitle}
+            </h2>
           </div>
 
-          <div className="mt-5 pt-4 border-t border-[#34313d] flex items-center justify-between text-[11px] text-[#a6a1b5]">
-            <span>Server-authoritative session</span>
+          <form onSubmit={handleSubmit} className="space-y-3.5 pt-1">
+            {errorMsg && (
+              <div
+                role="status"
+                className="px-3 py-1.5 text-xs font-mono border bg-[#3D2429] border-[#9E424B] text-[#FECACA]"
+              >
+                {errorMsg}
+              </div>
+            )}
+
+            {/* Username Input */}
+            <label className="stone-input flex items-center gap-3 px-3.5 h-12 focus-within:outline-2 focus-within:outline-[#C9C7D4]">
+              <span className="sr-only">Username</span>
+              <svg
+                width="20"
+                height="20"
+                viewBox="0 0 16 16"
+                fill="none"
+                aria-hidden="true"
+                className="shrink-0 text-[#B4B2BE]"
+              >
+                <rect x="6" y="2" width="4" height="4" fill="currentColor" />
+                <rect x="5" y="3" width="6" height="2" fill="currentColor" />
+                <rect x="4" y="8" width="8" height="2" fill="currentColor" />
+                <rect x="3" y="10" width="10" height="4" fill="currentColor" />
+              </svg>
+              <input
+                type="text"
+                name="username"
+                autoComplete="username"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                placeholder="Username"
+                maxLength={20}
+                className="w-full bg-transparent font-display text-base sm:text-lg tracking-wide text-[#F3F2F7] placeholder:text-[#9694A1] focus:outline-none"
+              />
+            </label>
+
+            {/* Password Input with Pixel Padlock & Visibility Toggle */}
+            <label className="stone-input flex items-center gap-3 px-3.5 h-12 focus-within:outline-2 focus-within:outline-[#C9C7D4]">
+              <span className="sr-only">Password</span>
+              <svg
+                width="20"
+                height="20"
+                viewBox="0 0 16 16"
+                fill="none"
+                aria-hidden="true"
+                className="shrink-0 text-[#B4B2BE]"
+              >
+                <rect x="5" y="2" width="6" height="2" fill="currentColor" />
+                <rect x="4" y="4" width="2" height="3" fill="currentColor" />
+                <rect x="10" y="4" width="2" height="3" fill="currentColor" />
+                <rect x="3" y="7" width="10" height="7" fill="currentColor" />
+                <rect x="7" y="9" width="2" height="3" fill="#3B3942" />
+              </svg>
+              <input
+                type={showPassword ? 'text' : 'password'}
+                name="password"
+                autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="Password"
+                className="w-full bg-transparent font-display text-base sm:text-lg tracking-wide text-[#F3F2F7] placeholder:text-[#9694A1] focus:outline-none"
+              />
+              <button
+                type="button"
+                onClick={() => setShowPassword((prev) => !prev)}
+                aria-label={showPassword ? 'Hide password' : 'Show password'}
+                className="shrink-0 p-1.5 text-[#AEACB8] hover:text-white cursor-pointer min-w-[40px] min-h-[40px] flex items-center justify-center"
+              >
+                {showPassword ? (
+                  <svg width="22" height="22" viewBox="0 0 16 16" fill="none">
+                    <rect x="4" y="4" width="8" height="1" fill="currentColor" />
+                    <rect x="2" y="5" width="2" height="2" fill="currentColor" />
+                    <rect x="12" y="5" width="2" height="2" fill="currentColor" />
+                    <rect x="1" y="7" width="1" height="2" fill="currentColor" />
+                    <rect x="14" y="7" width="1" height="2" fill="currentColor" />
+                    <rect x="2" y="9" width="2" height="2" fill="currentColor" />
+                    <rect x="12" y="9" width="2" height="2" fill="currentColor" />
+                    <rect x="4" y="11" width="8" height="1" fill="currentColor" />
+                    <rect x="6" y="6" width="4" height="4" fill="currentColor" />
+                  </svg>
+                ) : (
+                  <svg width="22" height="22" viewBox="0 0 16 16" fill="none">
+                    <rect x="4" y="4" width="8" height="1" fill="currentColor" />
+                    <rect x="2" y="5" width="2" height="2" fill="currentColor" />
+                    <rect x="12" y="5" width="2" height="2" fill="currentColor" />
+                    <rect x="1" y="7" width="1" height="2" fill="currentColor" />
+                    <rect x="14" y="7" width="1" height="2" fill="currentColor" />
+                    <rect x="2" y="9" width="2" height="2" fill="currentColor" />
+                    <rect x="12" y="9" width="2" height="2" fill="currentColor" />
+                    <rect x="4" y="11" width="8" height="1" fill="currentColor" />
+                    <rect x="6" y="6" width="4" height="4" fill="currentColor" />
+                    <path d="M2 13L13 2" stroke="currentColor" strokeWidth="1.8" />
+                  </svg>
+                )}
+              </button>
+            </label>
+
+            {/* Shared Class Selection in Register Mode */}
+            {mode === 'register' && (
+              <div className="space-y-2 pt-1">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="font-display text-white text-xs sm:text-sm font-semibold">
+                    Shared Class Identity
+                  </span>
+                  <span className="text-[11px] text-[#FBBF24] font-mono">
+                    Max Lv.{MAX_LEVEL}
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-2 gap-2">
+                  {(Object.keys(HERO_CLASSES) as HeroClassId[]).map((cid) => {
+                    const c = HERO_CLASSES[cid];
+                    const active = heroClass === cid;
+                    return (
+                      <button
+                        key={cid}
+                        type="button"
+                        onClick={() => setHeroClass(cid)}
+                        className={`stone-button h-auto items-start p-2 text-left transition-all gap-2.5 ${
+                          active ? 'stone-button-gold' : 'stone-button-dark'
+                        }`}
+                      >
+                        <div className="shrink-0 p-1 bg-black/20">
+                          <PixelHeroPreview heroClass={cid} size={40} animate={active} />
+                        </div>
+                        <div className="min-w-0 flex-1 text-left">
+                          <div className="flex items-center justify-between gap-1">
+                            <span
+                              className={`font-display text-xs sm:text-sm font-semibold truncate ${
+                                active ? 'text-black' : 'text-white'
+                              }`}
+                            >
+                              {c.name}
+                            </span>
+                          </div>
+                          <p
+                            className={`text-[10px] font-mono truncate ${
+                              active ? 'text-black/75' : 'text-[#9A98AA]'
+                            }`}
+                          >
+                            {c.weapon}
+                          </p>
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {/* Selected Class Detail Card */}
+                {(() => {
+                  const cur = HERO_CLASSES[heroClass];
+                  return (
+                    <div className="bg-[#242330] border border-[#3E3C4C] p-3 text-[11px] space-y-1.5">
+                      <div className="flex items-center justify-between text-[#FCD34D] font-display font-bold text-xs">
+                        <span>{cur.title}</span>
+                        <span className="text-[#4ADE80] font-mono font-bold">
+                          HP {cur.maxHp} · {cur.tacticalName}
+                        </span>
+                      </div>
+                      <p className="text-[#E2E8F0] text-[10.5px] leading-snug">
+                        <span className="text-[#FDE047] font-semibold">
+                          {cur.passiveName}:
+                        </span>{' '}
+                        {cur.passiveDesc}
+                      </p>
+                    </div>
+                  );
+                })()}
+              </div>
+            )}
+
+            {/* Raised Gold Primary Action Button */}
+            <div className="pt-1 flex justify-center">
+              <button
+                type="submit"
+                disabled={loading}
+                className="stone-button stone-button-gold w-full sm:w-[75%] h-14 text-xl"
+              >
+                {loading
+                  ? 'Connecting...'
+                  : mode === 'login'
+                  ? 'Log In'
+                  : 'Create Account'}
+              </button>
+            </div>
+          </form>
+
+          {/* Bottom Mode Switch & Dev Quick Fill */}
+          <div className="flex flex-wrap items-center justify-center gap-2.5 pt-3">
+            {mode === 'login' ? (
+              <button
+                type="button"
+                onClick={() => switchMode('register')}
+                className="stone-button stone-button-dark text-[10px] sm:text-xs py-1"
+              >
+                &gt; Create Account
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => switchMode('login')}
+                className="stone-button stone-button-dark text-[10px] sm:text-xs py-1"
+              >
+                &gt; Back to Log In
+              </button>
+            )}
             <button
               type="button"
               onClick={fillDevCredentials}
-              className="text-[#d9aa52] hover:underline font-medium"
+              className="stone-button stone-button-dark text-[10px] sm:text-xs py-1 text-[#FCD34D]"
+              title="Fill development convenience credentials (wanderer)"
             >
-              Use Dev Account (wanderer)
+              Dev Login
             </button>
           </div>
-        </div>
+        </section>
 
-        {/* Right: Beyond Class Showcase */}
-        <div className="lg:col-span-7 stone-panel rounded-sm p-6 flex flex-col justify-between">
-          <div>
-            <div className="flex items-center justify-between border-b border-[#34313d] pb-3 mb-4">
-              <div>
-                <h2 className="font-display text-xl text-[#f5f1e8]">
-                  Shared Beyond Class Archive
-                </h2>
-                <p className="text-xs text-[#b8b4c4]">
-                  Character classes, proportions, and sprites preserved from Beyond: Dungeons
-                </p>
-              </div>
-              <span className="text-[11px] font-mono-stat px-2 py-1 stone-plaque rounded-sm text-[#d9aa52]">
-                {selectedDef.roleBadge}
-              </span>
-            </div>
-
-            <div className="stone-plaque rounded-sm p-5 flex flex-col sm:flex-row items-center gap-6">
-              <div className="w-32 h-32 stone-input rounded-sm flex items-center justify-center shrink-0">
-                <PixelHeroPreview heroClass={heroClass} size={96} animate />
-              </div>
-
-              <div className="space-y-2 text-center sm:text-left">
-                <div>
-                  <h3 className="font-display text-2xl text-[#f5f1e8]">
-                    {selectedDef.name}
-                  </h3>
-                  <p className="text-xs font-semibold text-[#d9aa52]">
-                    {selectedDef.title} — {selectedDef.role}
-                  </p>
-                </div>
-                <p className="text-xs text-[#c7c3d1] leading-relaxed">
-                  {selectedDef.lore}
-                </p>
-                <div className="pt-1 grid grid-cols-1 sm:grid-cols-2 gap-2 text-[11px]">
-                  <div className="stone-input px-2.5 py-1.5 rounded-sm">
-                    <span className="text-[#9b96a8]">Default Weapon:</span>{' '}
-                    <span className="text-[#f3efe6] font-medium">{selectedDef.weapon}</span>
-                  </div>
-                  <div className="stone-input px-2.5 py-1.5 rounded-sm">
-                    <span className="text-[#9b96a8]">Tactical Skill:</span>{' '}
-                    <span className="text-[#d9aa52] font-medium">{selectedDef.tacticalName}</span>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div className="mt-5 grid grid-cols-4 gap-2">
-            {HERO_CLASS_LIST.map((def) => (
-              <button
-                key={def.id}
-                type="button"
-                onClick={() => setHeroClass(def.id)}
-                className={`stone-plaque p-2 rounded-sm flex flex-col items-center gap-1 transition-all ${
-                  heroClass === def.id
-                    ? 'border-[#d9aa52] bg-[#2e2a37]'
-                    : 'opacity-80 hover:opacity-100'
-                }`}
-              >
-                <PixelHeroPreview heroClass={def.id} size={44} animate={heroClass === def.id} />
-                <span className="font-display text-xs text-[#f3efe6]">{def.name}</span>
-              </button>
-            ))}
-          </div>
-        </div>
+        {/* Integrated Latest Updates Panel */}
+        <OverworldChangelogPanel
+          onOpenFullChangelog={() => setShowFullChangelog(true)}
+          className="shrink-0"
+        />
       </div>
-    </div>
+
+      <FullChangelogModal
+        isOpen={showFullChangelog}
+        onClose={() => setShowFullChangelog(false)}
+      />
+    </main>
   );
 };

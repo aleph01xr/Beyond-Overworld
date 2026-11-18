@@ -44,6 +44,32 @@ Visual Development
 
 ---
 
+[0.1.1] — 2026-11-17 (Phase 1 — UI & Controls Parity)
+
+Added
+
+- Mobile touch gamepad (`client/src/ui/TouchControls.tsx`) with floating & fixed virtual joysticks, smooth analog movement, multitouch handling, safe-area support, and Overworld-supported combat probes.
+- Saved touch & display settings (`client/src/ui/TouchSettingsModal.tsx`) persisted in `localStorage` (`beyond_overworld_touch_settings`) plus `Always Show Touch Gamepad` testing toggle and Fullscreen mode.
+- Update Log panel and modal (`client/src/ui/OverworldChangelogModal.tsx`) displayed alongside the login card.
+
+Changed
+
+- Rebuilt `AuthScreen.tsx`, `InstanceLobby.tsx`, `OverworldHud.tsx`, and `.stone-*` theme rules (`client/src/ui/index.css`) to match `Beyond: Dungeons`' dark fantasy atmosphere, floating pixel embers, stone-bevel layout, password visibility toggle, top HUD action bar, and responsive spacing while retaining Overworld auth APIs and Overworld-specific readouts.
+- Remapped desktop Tactical Skill probe binding from `[E]` to `[Q]` alongside `WASD` / Arrow movement and `[Space / LMB]` Basic Attack probe to match `Beyond: Dungeons`, keeping inputs blocked during chat typing and released cleanly on blur/visibility/modal focus/leave.
+
+Fixed
+
+- Updated `OverworldNetworkClient.sendInput()` to include normalized analog `stickX` and `stickY` in the input-change signature and `isMoving` check, transmit stop packets immediately on release, maintain sequence reconciliation, and eliminate idle WebSocket traffic.
+- Updated `normalizePlayerInputDirection` and `hasMovementInput` (`shared/movement/playerMovement.ts`) to use a consistent `> 0.05` radial magnitude threshold and normalized diagonal movement.
+
+Testing
+
+- Vitest suite (`server/tests/foundation.test.ts`): 9/9 tests passing, including analog `stickX`/`stickY` movement, diagonal normalization, wall collision, `OverworldNetworkClient.sendInput` analog deduplication/idle silence, and `LocalPredictionController` bounds/reconciliation.
+- Live HTTP + WebSocket smoke test against port 3000 passed (register, login, `OVERWORLD-1` join, analog diagonal `player:input`, immediate velocity stop on release, Safe Zone `Q` tactical probe rejection).
+- Interactive touchscreen drag/multitouch gestures on physical mobile hardware not tested in this headless container (desktop + headless WS + unit suites verified).
+
+---
+
 [0.1.0] — 2026-11-17
 
 Added

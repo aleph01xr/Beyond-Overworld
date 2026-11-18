@@ -48,6 +48,8 @@ const IDLE_INPUT: OverworldInputState = {
   right: false,
   attack: false,
   aimAngle: 0,
+  stickX: 0,
+  stickY: 0,
 };
 
 export interface JoinInstanceResult {

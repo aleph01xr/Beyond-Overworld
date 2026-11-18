@@ -143,18 +143,46 @@ export class OverworldNetworkClient {
     this.ws.send(JSON.stringify(msg));
   }
 
-  sendInput(input: OverworldInputState, seq: number): void {
+  sendInput(input: OverworldInputState, seq: number, force = false): void {
+    const rawStickX = typeof input.stickX === 'number' ? input.stickX : 0;
+    const rawStickY = typeof input.stickY === 'number' ? input.stickY : 0;
+    const stickMag = Math.hypot(rawStickX, rawStickY);
+    const stickActive = stickMag > 0.05;
+    const stickX = stickActive ? rawStickX : 0;
+    const stickY = stickActive ? rawStickY : 0;
+
     const sig = `${Number(input.up)}${Number(input.down)}${Number(input.left)}${Number(
       input.right
-    )}:${input.aimAngle.toFixed(2)}`;
+    )}:${Number(input.attack)}:${stickX.toFixed(3)}:${stickY.toFixed(3)}:${input.aimAngle.toFixed(2)}`;
+
+    const isMoving =
+      input.up || input.down || input.left || input.right || stickActive;
+
     const now = performance.now();
-    const isMoving = input.up || input.down || input.left || input.right;
-    if (!isMoving && sig === this.lastInputSignature && now - this.lastInputSentAt < 180) {
+    const signatureChanged = sig !== this.lastInputSignature;
+
+    // When completely idle and unchanged (stop already transmitted), emit zero idle traffic
+    if (!force && !isMoving && !signatureChanged) {
       return;
     }
+
+    // While actively holding steady analog or keyboard input, keep updates synced for sequence reconciliation
+    // while avoiding redundant aim-only bursts > 20 Hz when stationary
+    if (!force && !isMoving && signatureChanged && now - this.lastInputSentAt < 45) {
+      return;
+    }
+
     this.lastInputSignature = sig;
     this.lastInputSentAt = now;
-    this.send({ type: 'player:input', input, seq });
+    this.send({
+      type: 'player:input',
+      input: {
+        ...input,
+        stickX,
+        stickY,
+      },
+      seq,
+    });
   }
 
   dispose(): void {

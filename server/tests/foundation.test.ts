@@ -1,16 +1,22 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import {
   TILE_SIZE,
   getDefaultWeaponId,
 } from '../../shared/constants/classes.ts';
 import { OVERWORLD_INSTANCE_CAPACITY } from '../../shared/constants/zones.ts';
 import {
+  hasMovementInput,
+  normalizePlayerInputDirection,
+} from '../../shared/movement/playerMovement.ts';
+import {
   applySnapshotDelta,
   cloneSnapshotBaseline,
   computeSnapshotDelta,
 } from '../../shared/protocols/snapshotDelta.ts';
-import type { CharacterIdentity } from '../../shared/types/domain.ts';
+import type { CharacterIdentity, OverworldInputState } from '../../shared/types/domain.ts';
 import { ClientMessageSchema } from '../../shared/validation/schemas.ts';
+import { LocalPredictionController } from '../../client/src/game/world/prediction.ts';
+import { OverworldNetworkClient } from '../../client/src/networking/networkClient.ts';
 import { DevCharacterAdapter } from '../src/characters/characterIntegrationAdapter.ts';
 import { WorldInstance } from '../src/instances/worldInstance.ts';
 import { WorldInstanceManager } from '../src/instances/worldInstanceManager.ts';
@@ -382,5 +388,259 @@ describe('Beyond: Overworld Foundation Systems', () => {
     expect(honorResult.accepted).toBe(true);
     expect(honorResult.newHonorBalance).toBe(25);
     expect((await adapter.getCharacterByAccountId(char.accountId))?.xp).toBe(0);
+  });
+
+  it('normalizes keyboard & analog stickX/stickY diagonals, prevents wall tunneling, and stops cleanly on release', () => {
+    const diagKeys = normalizePlayerInputDirection({
+      up: true,
+      down: false,
+      left: false,
+      right: true,
+      stickX: 0,
+      stickY: 0,
+    });
+    expect(Math.hypot(diagKeys.mx, diagKeys.my)).toBeCloseTo(1, 5);
+
+    const diagStick = normalizePlayerInputDirection({
+      up: false,
+      down: false,
+      left: false,
+      right: false,
+      stickX: 1,
+      stickY: 1,
+    });
+    expect(Math.hypot(diagStick.mx, diagStick.my)).toBeCloseTo(1, 5);
+
+    const halfStick = normalizePlayerInputDirection({
+      up: false,
+      down: false,
+      left: false,
+      right: false,
+      stickX: 0.35,
+      stickY: -0.35,
+    });
+    expect(Math.hypot(halfStick.mx, halfStick.my)).toBeCloseTo(Math.hypot(0.35, -0.35), 5);
+    expect(
+      hasMovementInput({
+        up: false,
+        down: false,
+        left: false,
+        right: false,
+        stickX: 0.35,
+        stickY: -0.35,
+      })
+    ).toBe(true);
+    expect(
+      hasMovementInput({
+        up: false,
+        down: false,
+        left: false,
+        right: false,
+        stickX: 0.02,
+        stickY: 0.02,
+      })
+    ).toBe(false);
+
+    const instance = new WorldInstance({
+      instanceId: 'ANALOG-TEST',
+      name: 'Analog Movement Test',
+    });
+    const joined = instance.addOrReconnectPlayer(makeIdentity(20));
+    const startX = joined.player!.x;
+    const startY = joined.player!.y;
+
+    // Move Northwest via purely analog stickX / stickY (all keyboard booleans false)
+    instance.setPlayerInput(
+      'char_20',
+      {
+        up: false,
+        down: false,
+        left: false,
+        right: false,
+        attack: false,
+        aimAngle: -Math.PI * 0.75,
+        stickX: -0.6,
+        stickY: -0.8,
+      },
+      1
+    );
+    for (let i = 0; i < 20; i++) instance.step(25);
+    const moved = instance.getPlayerState('char_20')!;
+    expect(moved.x).toBeLessThan(startX);
+    expect(moved.y).toBeLessThan(startY);
+    expect(moved.lastInputSeq).toBe(1);
+
+    // Release joystick -> velocity stops immediately on next step
+    instance.setPlayerInput(
+      'char_20',
+      {
+        up: false,
+        down: false,
+        left: false,
+        right: false,
+        attack: false,
+        aimAngle: -Math.PI * 0.75,
+        stickX: 0,
+        stickY: 0,
+      },
+      2
+    );
+    instance.step(25);
+    const stopped = instance.getPlayerState('char_20')!;
+    expect(stopped.vx).toBe(0);
+    expect(stopped.vy).toBe(0);
+    expect(stopped.lastInputSeq).toBe(2);
+
+    // Drive straight West via analog stick to verify outer wall collision holds
+    instance.setPlayerInput(
+      'char_20',
+      {
+        up: false,
+        down: false,
+        left: false,
+        right: false,
+        attack: false,
+        aimAngle: Math.PI,
+        stickX: -1,
+        stickY: 0,
+      },
+      3
+    );
+    for (let i = 0; i < 400; i++) instance.step(25);
+    expect(instance.getPlayerState('char_20')!.x).toBeGreaterThan(TILE_SIZE);
+  });
+});
+
+describe('OverworldNetworkClient Analog Input & Prediction Reconciliation', () => {
+  const originalWebSocket = (globalThis as { WebSocket?: unknown }).WebSocket;
+  const originalWindow = (globalThis as { window?: unknown }).window;
+
+  afterEach(() => {
+    (globalThis as { WebSocket?: unknown }).WebSocket = originalWebSocket;
+    (globalThis as { window?: unknown }).window = originalWindow;
+  });
+
+  it('tracks stickX/stickY in sendInput, sends held analog updates, stops on release, and emits zero idle traffic', () => {
+    const sentMessages: string[] = [];
+    class MockWebSocket {
+      static OPEN = 1;
+      readyState = 1;
+      onopen: (() => void) | null = null;
+      onmessage: ((evt: { data: string }) => void) | null = null;
+      onclose: (() => void) | null = null;
+      constructor(public url: string, public protocols?: string[]) {}
+      send(data: string) {
+        sentMessages.push(data);
+      }
+      close() {}
+    }
+
+    (globalThis as { WebSocket?: unknown }).WebSocket = MockWebSocket;
+    (globalThis as { window?: unknown }).window = {
+      location: { protocol: 'http:', host: '127.0.0.1:3000' },
+    };
+
+    const client = new OverworldNetworkClient('tok_test', {
+      onLobbyUpdate: () => {},
+      onInstanceJoined: () => {},
+      onInstanceLeft: () => {},
+      onSnapshot: () => {},
+      onChatMessage: () => {},
+      onRejected: () => {},
+      onPingSample: () => {},
+      onConnectionStateChange: () => {},
+    });
+    client.connect();
+
+    const idleInput: OverworldInputState = {
+      up: false,
+      down: false,
+      left: false,
+      right: false,
+      attack: false,
+      aimAngle: 0,
+      stickX: 0,
+      stickY: 0,
+    };
+
+    // First idle call establishes signature; subsequent identical idle calls emit zero packets
+    client.sendInput(idleInput, 1, false);
+    expect(sentMessages.length).toBe(1);
+    client.sendInput(idleInput, 2, false);
+    client.sendInput(idleInput, 3, false);
+    expect(sentMessages.length).toBe(1);
+
+    // Holding analog stick sends continuous frames with stickX/stickY preserved
+    const stickMoveA: OverworldInputState = { ...idleInput, stickX: 0.42, stickY: -0.61 };
+    client.sendInput(stickMoveA, 4, false);
+    client.sendInput(stickMoveA, 5, false);
+    expect(sentMessages.length).toBe(3);
+    const parsedA = JSON.parse(sentMessages[2]) as {
+      type: string;
+      input: OverworldInputState;
+      seq: number;
+    };
+    expect(parsedA.type).toBe('player:input');
+    expect(parsedA.input.stickX).toBeCloseTo(0.42, 3);
+    expect(parsedA.input.stickY).toBeCloseTo(-0.61, 3);
+    expect(parsedA.seq).toBe(5);
+
+    // Changing analog stick angle sends updated stick values
+    const stickMoveB: OverworldInputState = { ...idleInput, stickX: -0.8, stickY: 0.2 };
+    client.sendInput(stickMoveB, 6, false);
+    expect(sentMessages.length).toBe(4);
+    const parsedB = JSON.parse(sentMessages[3]) as { input: OverworldInputState; seq: number };
+    expect(parsedB.input.stickX).toBeCloseTo(-0.8, 3);
+    expect(parsedB.input.stickY).toBeCloseTo(0.2, 3);
+
+    // Releasing joystick immediately sends zeroed stop packet, then resumes 0 idle traffic
+    client.sendInput(idleInput, 7, true);
+    expect(sentMessages.length).toBe(5);
+    const parsedStop = JSON.parse(sentMessages[4]) as { input: OverworldInputState; seq: number };
+    expect(parsedStop.input.stickX).toBe(0);
+    expect(parsedStop.input.stickY).toBe(0);
+
+    client.sendInput(idleInput, 8, false);
+    client.sendInput(idleInput, 9, false);
+    expect(sentMessages.length).toBe(5);
+
+    client.dispose();
+  });
+
+  it('bounds client prediction history and reconciles analog stick movement cleanly', () => {
+    const instance = new WorldInstance({
+      instanceId: 'RECON-TEST',
+      name: 'Recon Test',
+    });
+    const joined = instance.addOrReconnectPlayer(makeIdentity(30));
+    const localPlayer = joined.player!;
+    const controller = new LocalPredictionController();
+    controller.reset(localPlayer);
+
+    const moveInput: OverworldInputState = {
+      up: false,
+      down: false,
+      left: false,
+      right: false,
+      attack: false,
+      aimAngle: 0,
+      stickX: 0.75,
+      stickY: 0,
+    };
+
+    // Simulate 210 unacked prediction steps (> 180 cap)
+    for (let i = 0; i < 210; i++) {
+      const seq = controller.allocateSeq();
+      controller.predictStep(seq, moveInput, 0.025, instance.map, localPlayer);
+    }
+
+    // Also advance server for last 30 steps and ack seq 30
+    instance.setPlayerInput(localPlayer.id, moveInput, 30);
+    for (let i = 0; i < 30; i++) instance.step(25);
+    const updatedServerState = instance.getPlayerState(localPlayer.id)!;
+
+    controller.reconcileWithServer(updatedServerState, instance.map);
+    const pose = controller.getPredictedPose(updatedServerState, instance.map);
+    expect(pose.x).toBeGreaterThan(updatedServerState.x);
   });
 });
