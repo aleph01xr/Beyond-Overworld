@@ -10,7 +10,7 @@ import {
 } from '../../../shared/protocols/snapshotDelta.ts';
 import type { ServerMessage } from '../../../shared/protocols/wsProtocol.ts';
 import { ClientMessageSchema } from '../../../shared/validation/schemas.ts';
-import type { AuthService } from '../auth/authService.ts';
+import type { AuthService, AuthSession } from '../auth/authService.ts';
 import type { CharacterIntegrationLayer } from '../characters/characterIntegrationAdapter.ts';
 import type { WorldInstanceManager } from '../instances/worldInstanceManager.ts';
 import {
@@ -91,11 +91,13 @@ export function attachWsGateway(options: {
     }
   };
 
-  wss.on('connection', (ws: WebSocket, session: { accountId: string; username: string }) => {
+  wss.on('connection', (ws: WebSocket, session: AuthSession) => {
     const client: AuthenticatedWsClient = {
       socket: ws,
       accountId: session.accountId,
       username: session.username,
+      isAdmin: session.isAdmin,
+      provider: session.provider,
       instanceId: null,
       playerId: null,
       lastAckBaseline: null,

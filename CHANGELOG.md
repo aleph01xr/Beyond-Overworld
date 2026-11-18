@@ -44,6 +44,29 @@ Visual Development
 
 ---
 
+[0.1.2] — 2026-11-17 (Shared Identity Integration Preparation)
+
+Added
+
+- Backend-only external identity configuration resolver (`server/src/auth/identityConfig.ts`) supporting `DUNGEONS_API_URL` and `BEYOND_IDENTITY_SECRET` with safe unconfigured/partial diagnostics and zero client secret exposure.
+- Identity provider abstraction (`server/src/auth/identityProvider.ts`) separating `LocalIdentityProvider` (`local_dev`) from the prepared `DungeonsIdentityProvider` (`dungeons`, `isOperational: false` until Dungeons backend becomes available) with strict HMAC-SHA256 assertion verification helpers (`verifySignedAssertion`).
+- Server-side administrator authorization guard (`server/src/auth/adminAuthorization.ts`) with `isServerAdmin`, `assertServerAdmin`, `requireAdminSession`, and `/api/admin/status` foundation endpoint.
+- Shared authoritative account contract (`SharedAccountIdentity` in `shared/types/domain.ts`) supporting `accountId`, `username`, `isAdmin`, `preferredClass`, `lockedClass`, `level`, `xp`, `strength`, `vitality`, `dexterity`, `intelligence`, `faith`, and `attributePoints`.
+
+Changed
+
+- Refactored `AuthService` (`server/src/auth/authService.ts`) to issue local Overworld sessions bound to authoritative `accountId`, `isAdmin`, and `provider`, while preserving existing local login, registration, and `wanderer` dev seed account flows.
+- Extended `CharacterIntegrationLayer` and `DevCharacterAdapter` (`server/src/characters/characterIntegrationAdapter.ts`) with non-destructive `syncAuthoritativeIdentity()` keyed by `accountId`.
+- Propagated server-verified `isAdmin` and `provider` onto `/api/auth/me`, `AuthenticatedWsClient` (`wsTransport.ts`, `wsGateway.ts`), and sanitized `identityProvider` status onto `/api/health`.
+
+Testing
+
+- Vitest suite (`server/tests/foundation.test.ts` & `server/tests/identityIntegration.test.ts`): 13/13 tests passing.
+- Verified local auth/registration/dev-seed continuity, rejection of unsigned/tampered assertions, refusal of client/username-based admin elevation (`Aleph` remains non-admin), missing/partial external config safety, and `DevCharacterAdapter` authoritative sync.
+- Live Beyond: Dungeons backend login/transfer remains inactive until the Dungeons backend service is connected.
+
+---
+
 [0.1.1] — 2026-11-17 (Phase 1 — UI & Controls Parity)
 
 Added

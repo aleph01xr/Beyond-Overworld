@@ -6,7 +6,10 @@ import {
   type ArmamentSlot,
   type HeroClassId,
 } from '../../../shared/constants/classes.ts';
-import type { CharacterIdentity } from '../../../shared/types/domain.ts';
+import type {
+  CharacterIdentity,
+  SharedAccountIdentity,
+} from '../../../shared/types/domain.ts';
 
 export interface ArmamentUpdateResult {
   ok: boolean;
@@ -26,7 +29,11 @@ export interface CharacterIntegrationLayer {
     accountId: string;
     username: string;
     heroClass: HeroClassId;
+    preferredClass?: HeroClassId;
+    lockedClass?: HeroClassId;
+    isAdmin?: boolean;
   }): Promise<CharacterIdentity>;
+  syncAuthoritativeIdentity(identity: SharedAccountIdentity): Promise<CharacterIdentity>;
   updateEquippedArmament(params: {
     accountId: string;
     slot: ArmamentSlot;
@@ -37,7 +44,8 @@ export interface CharacterIntegrationLayer {
 
 /**
  * Local development adapter simulating the future Beyond Universe shared character API.
- * Enforces exact Beyond: Dungeons class/level/attribute/Armament schemas (DD-014..DD-015).
+ * Enforces exact Beyond: Dungeons class/level/attribute/Armament schemas (DD-014..DD-015)
+ * and syncs authoritative identity records keyed by accountId.
  */
 export class DevCharacterAdapter implements CharacterIntegrationLayer {
   private readonly charactersByAccount = new Map<string, CharacterIdentity>();
@@ -51,15 +59,23 @@ export class DevCharacterAdapter implements CharacterIntegrationLayer {
     accountId: string;
     username: string;
     heroClass: HeroClassId;
+    preferredClass?: HeroClassId;
+    lockedClass?: HeroClassId;
+    isAdmin?: boolean;
   }): Promise<CharacterIdentity> {
     const existing = this.charactersByAccount.get(params.accountId);
     if (existing) return structuredClone(existing);
+
+    const lockedClass = params.lockedClass ?? params.heroClass;
+    const preferredClass = params.preferredClass ?? params.heroClass;
 
     const created: CharacterIdentity = {
       accountId: params.accountId,
       characterId: `char_${randomUUID()}`,
       username: params.username,
-      heroClass: params.heroClass,
+      heroClass: lockedClass,
+      preferredClass,
+      lockedClass,
       level: 1,
       xp: 0,
       attributes: {
@@ -71,15 +87,56 @@ export class DevCharacterAdapter implements CharacterIntegrationLayer {
       },
       attributePoints: 0,
       equippedArmament: {
-        weaponId: getDefaultWeaponId(params.heroClass),
-        vestmentId: getDefaultVestmentId(params.heroClass),
+        weaponId: getDefaultWeaponId(lockedClass),
+        vestmentId: getDefaultVestmentId(lockedClass),
       },
       permanentUnlocks: [],
       arenaHonor: 0,
+      isAdmin: params.isAdmin === true,
     };
 
     this.charactersByAccount.set(params.accountId, created);
     return structuredClone(created);
+  }
+
+  async syncAuthoritativeIdentity(
+    identity: SharedAccountIdentity
+  ): Promise<CharacterIdentity> {
+    const existing = this.charactersByAccount.get(identity.accountId);
+    const resolvedClass = identity.lockedClass ?? identity.preferredClass;
+    const defaultArmament = {
+      weaponId: getDefaultWeaponId(resolvedClass),
+      vestmentId: getDefaultVestmentId(resolvedClass),
+    };
+
+    const synced: CharacterIdentity = {
+      accountId: identity.accountId,
+      characterId:
+        identity.characterId ?? existing?.characterId ?? `char_${randomUUID()}`,
+      username: identity.username,
+      heroClass: resolvedClass,
+      preferredClass: identity.preferredClass,
+      lockedClass: identity.lockedClass,
+      level: identity.level,
+      xp: identity.xp,
+      attributes: {
+        strength: identity.strength,
+        vitality: identity.vitality,
+        dexterity: identity.dexterity,
+        intelligence: identity.intelligence,
+        faith: identity.faith,
+      },
+      attributePoints: identity.attributePoints,
+      equippedArmament:
+        identity.equippedArmament ?? existing?.equippedArmament ?? defaultArmament,
+      permanentUnlocks:
+        identity.permanentUnlocks ?? existing?.permanentUnlocks ?? [],
+      arenaHonor: identity.arenaHonor ?? existing?.arenaHonor ?? 0,
+      isAdmin: identity.isAdmin === true,
+    };
+
+    this.charactersByAccount.set(identity.accountId, synced);
+    return structuredClone(synced);
   }
 
   async updateEquippedArmament(params: {

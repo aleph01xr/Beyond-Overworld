@@ -1,5 +1,8 @@
 import type { WebSocket } from 'ws';
-import type { OverworldSnapshot } from '../../../shared/types/domain.ts';
+import type {
+  IdentityProviderKind,
+  OverworldSnapshot,
+} from '../../../shared/types/domain.ts';
 import type { ServerMessage } from '../../../shared/protocols/wsProtocol.ts';
 
 const WS_OPEN = 1;
@@ -10,6 +13,8 @@ export interface AuthenticatedWsClient {
   socket: WebSocket;
   accountId: string;
   username: string;
+  isAdmin: boolean;
+  provider: IdentityProviderKind;
   instanceId: string | null;
   playerId: string | null;
   lastAckBaseline: OverworldSnapshot | null;

@@ -1,20 +1,28 @@
-import { randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import type { HeroClassId } from '../../../shared/constants/classes.ts';
-import type { CharacterIdentity } from '../../../shared/types/domain.ts';
+import type {
+  CharacterIdentity,
+  IdentityProviderKind,
+  SharedAccountIdentity,
+} from '../../../shared/types/domain.ts';
 import type { CharacterIntegrationLayer } from '../characters/characterIntegrationAdapter.ts';
-
-interface AccountRecord {
-  accountId: string;
-  username: string;
-  usernameLower: string;
-  passwordHash: string;
-  createdAt: number;
-}
+import {
+  resolveIdentityConfig,
+  toPublicIdentityConfigStatus,
+  type PublicIdentityConfigStatus,
+  type ResolvedIdentityConfig,
+} from './identityConfig.ts';
+import {
+  DungeonsIdentityProvider,
+  LocalIdentityProvider,
+} from './identityProvider.ts';
 
 export interface AuthSession {
   token: string;
   accountId: string;
   username: string;
+  isAdmin: boolean;
+  provider: IdentityProviderKind;
   expiresAt: number;
 }
 
@@ -22,53 +30,89 @@ export interface AuthResult {
   ok: boolean;
   token?: string;
   character?: CharacterIdentity;
+  isAdmin?: boolean;
+  provider?: IdentityProviderKind;
+  code?: string;
   error?: string;
+}
+
+export interface AuthServiceOptions {
+  env?: Record<string, string | undefined>;
+  seedDevAccount?: boolean;
+}
+
+export interface IdentityProviderStatusSummary {
+  activeLocalProvider: IdentityProviderKind;
+  externalProviderConfigured: boolean;
+  externalProviderOperational: boolean;
+  externalConfig: PublicIdentityConfigStatus;
 }
 
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 
-function hashPassword(password: string): string {
-  const salt = randomBytes(16).toString('hex');
-  const hash = scryptSync(password, salt, 64).toString('hex');
-  return `${salt}:${hash}`;
-}
-
-function verifyPassword(password: string, storedHash: string): boolean {
-  const parts = storedHash.split(':');
-  if (parts.length !== 2) return false;
-  const [salt, keyHex] = parts;
-  if (!salt || !keyHex) return false;
-  const keyBuf = Buffer.from(keyHex, 'hex');
-  const derivedBuf = scryptSync(password, salt, 64);
-  if (keyBuf.length !== derivedBuf.length) return false;
-  return timingSafeEqual(keyBuf, derivedBuf);
-}
-
 export class AuthService {
-  private readonly accountsByLower = new Map<string, AccountRecord>();
   private readonly sessionsByToken = new Map<string, AuthSession>();
+  private readonly identityConfig: ResolvedIdentityConfig;
+  private readonly localProvider: LocalIdentityProvider;
+  private readonly externalProvider: DungeonsIdentityProvider;
 
-  constructor(private readonly characterAdapter: CharacterIntegrationLayer) {
-    if (process.env.NODE_ENV !== 'production') {
-      void this.seedDevAccount();
+  constructor(
+    private readonly characterAdapter: CharacterIntegrationLayer,
+    options?: AuthServiceOptions
+  ) {
+    this.identityConfig = resolveIdentityConfig(options?.env ?? process.env);
+    this.localProvider = new LocalIdentityProvider({
+      seedDevAccount: options?.seedDevAccount,
+    });
+    this.externalProvider = new DungeonsIdentityProvider(this.identityConfig);
+
+    console.log(`[Auth] ${this.identityConfig.diagnosticMessage}`);
+
+    // Ensure the seeded local dev character exists when enabled
+    if (options?.seedDevAccount ?? process.env.NODE_ENV !== 'production') {
+      void this.ensureDevSeedCharacter();
     }
   }
 
-  private async seedDevAccount(): Promise<void> {
-    if (this.accountsByLower.has('wanderer')) return;
-    const accountId = 'acc_dev_wanderer';
-    this.accountsByLower.set('wanderer', {
-      accountId,
-      username: 'wanderer',
-      usernameLower: 'wanderer',
-      passwordHash: hashPassword('wanderer123'),
-      createdAt: Date.now(),
-    });
-    await this.characterAdapter.createCharacterForAccount({
-      accountId,
-      username: 'wanderer',
-      heroClass: 'vanguard',
-    });
+  private async ensureDevSeedCharacter(): Promise<void> {
+    const devLogin = await this.localProvider.authenticateWithCredentials(
+      'wanderer',
+      'wanderer123'
+    );
+    if (devLogin.ok && devLogin.identity) {
+      await this.characterAdapter.syncAuthoritativeIdentity(devLogin.identity);
+    }
+  }
+
+  /**
+   * Returns sanitized configuration state (never includes BEYOND_IDENTITY_SECRET).
+   */
+  getIdentityProviderStatus(): IdentityProviderStatusSummary {
+    return {
+      activeLocalProvider: this.localProvider.kind,
+      externalProviderConfigured: this.externalProvider.isConfigured,
+      externalProviderOperational: this.externalProvider.isOperational,
+      externalConfig: toPublicIdentityConfigStatus(this.identityConfig),
+    };
+  }
+
+  getExternalProvider(): DungeonsIdentityProvider {
+    return this.externalProvider;
+  }
+
+  /**
+   * Server-side seed helper for tests verifying server-authoritative admin privileges
+   * without trusting usernames or client-submitted flags.
+   */
+  async seedLocalAccountForTest(params: {
+    accountId: string;
+    username: string;
+    password: string;
+    preferredClass?: HeroClassId;
+    isAdmin?: boolean;
+  }): Promise<CharacterIdentity> {
+    const identity = this.localProvider.seedAccountInternal(params);
+    return this.characterAdapter.syncAuthoritativeIdentity(identity);
   }
 
   async register(
@@ -76,50 +120,71 @@ export class AuthService {
     password: string,
     heroClass: HeroClassId
   ): Promise<AuthResult> {
-    const username = usernameRaw.trim();
-    const usernameLower = username.toLowerCase();
-    if (this.accountsByLower.has(usernameLower)) {
-      return { ok: false, error: 'That account name is already claimed.' };
-    }
-
-    const accountId = `acc_${randomUUID()}`;
-    const record: AccountRecord = {
-      accountId,
-      username,
-      usernameLower,
-      passwordHash: hashPassword(password),
-      createdAt: Date.now(),
-    };
-    this.accountsByLower.set(usernameLower, record);
-
-    const character = await this.characterAdapter.createCharacterForAccount({
-      accountId,
-      username,
-      heroClass,
+    const verification = await this.localProvider.registerAccount({
+      username: usernameRaw,
+      password,
+      preferredClass: heroClass,
     });
 
-    const token = this.issueSession(record);
-    return { ok: true, token, character };
+    if (!verification.ok || !verification.identity) {
+      return {
+        ok: false,
+        provider: verification.provider,
+        code: verification.code,
+        error: verification.error ?? 'Registration failed.',
+      };
+    }
+
+    return this.createAuthorizedSessionResult(
+      verification.identity,
+      verification.provider
+    );
   }
 
   async login(usernameRaw: string, password: string): Promise<AuthResult> {
-    const usernameLower = usernameRaw.trim().toLowerCase();
-    const account = this.accountsByLower.get(usernameLower);
-    if (!account || !verifyPassword(password, account.passwordHash)) {
-      return { ok: false, error: 'Invalid username or password.' };
+    const verification = await this.localProvider.authenticateWithCredentials(
+      usernameRaw,
+      password
+    );
+
+    if (!verification.ok || !verification.identity) {
+      return {
+        ok: false,
+        provider: verification.provider,
+        code: verification.code,
+        error: verification.error ?? 'Invalid username or password.',
+      };
     }
 
-    let character = await this.characterAdapter.getCharacterByAccountId(account.accountId);
-    if (!character) {
-      character = await this.characterAdapter.createCharacterForAccount({
-        accountId: account.accountId,
-        username: account.username,
-        heroClass: 'vanguard',
-      });
+    return this.createAuthorizedSessionResult(
+      verification.identity,
+      verification.provider
+    );
+  }
+
+  /**
+   * Entry point prepared for future Beyond: Dungeons signed identity assertions.
+   * Overworld validates cryptographic signature + payload server-side via BEYOND_IDENTITY_SECRET,
+   * syncs character state keyed by Dungeons' authoritative accountId, and issues its own session.
+   */
+  async authenticateExternalAssertion(assertionToken: string): Promise<AuthResult> {
+    const verification = await this.externalProvider.verifySignedAssertion(
+      assertionToken
+    );
+
+    if (!verification.ok || !verification.identity) {
+      return {
+        ok: false,
+        provider: verification.provider,
+        code: verification.code,
+        error: verification.error ?? 'External identity verification failed.',
+      };
     }
 
-    const token = this.issueSession(account);
-    return { ok: true, token, character };
+    return this.createAuthorizedSessionResult(
+      verification.identity,
+      verification.provider
+    );
   }
 
   async getSessionCharacter(token: string): Promise<{
@@ -128,8 +193,13 @@ export class AuthService {
   } | null> {
     const session = this.validateSessionToken(token);
     if (!session) return null;
-    const character = await this.characterAdapter.getCharacterByAccountId(session.accountId);
+    const character = await this.characterAdapter.getCharacterByAccountId(
+      session.accountId
+    );
     if (!character) return null;
+
+    // Ensure returned character never diverges from session's authoritative isAdmin flag
+    character.isAdmin = session.isAdmin;
     return { session, character };
   }
 
@@ -148,12 +218,42 @@ export class AuthService {
     this.sessionsByToken.delete(token);
   }
 
-  private issueSession(account: AccountRecord): string {
+  private async createAuthorizedSessionResult(
+    identity: SharedAccountIdentity,
+    provider: IdentityProviderKind
+  ): Promise<AuthResult> {
+    const character = await this.characterAdapter.syncAuthoritativeIdentity(identity);
+    character.isAdmin = identity.isAdmin === true;
+
+    const token = this.issueSession({
+      accountId: identity.accountId,
+      username: identity.username,
+      isAdmin: identity.isAdmin === true,
+      provider,
+    });
+
+    return {
+      ok: true,
+      token,
+      character,
+      isAdmin: identity.isAdmin === true,
+      provider,
+    };
+  }
+
+  private issueSession(params: {
+    accountId: string;
+    username: string;
+    isAdmin: boolean;
+    provider: IdentityProviderKind;
+  }): string {
     const token = randomBytes(32).toString('hex');
     this.sessionsByToken.set(token, {
       token,
-      accountId: account.accountId,
-      username: account.username,
+      accountId: params.accountId,
+      username: params.username,
+      isAdmin: params.isAdmin,
+      provider: params.provider,
       expiresAt: Date.now() + SESSION_TTL_MS,
     });
     return token;

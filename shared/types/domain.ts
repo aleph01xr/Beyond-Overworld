@@ -14,6 +14,32 @@ export interface EquippedArmament {
   vestmentId: string | null;
 }
 
+export type IdentityProviderKind = 'local_dev' | 'dungeons';
+
+/**
+ * Authoritative Beyond Universe / Beyond: Dungeons account identity contract
+ * used at the backend identity & character integration boundary.
+ */
+export interface SharedAccountIdentity {
+  accountId: string;
+  username: string;
+  isAdmin: boolean;
+  preferredClass: HeroClassId;
+  lockedClass: HeroClassId;
+  level: number;
+  xp: number;
+  strength: number;
+  vitality: number;
+  dexterity: number;
+  intelligence: number;
+  faith: number;
+  attributePoints: number;
+  characterId?: string;
+  equippedArmament?: EquippedArmament;
+  permanentUnlocks?: string[];
+  arenaHonor?: number;
+}
+
 /**
  * Shared permanent character identity contract mirrored from Beyond: Dungeons
  * (DD-002, ARCHITECTURE.md Section 12, REFERENCE_AUDIT.md Section 5.3).
@@ -23,6 +49,8 @@ export interface CharacterIdentity {
   characterId: string;
   username: string;
   heroClass: HeroClassId;
+  preferredClass?: HeroClassId;
+  lockedClass?: HeroClassId;
   level: number;
   xp: number;
   attributes: CharacterAttributes;
